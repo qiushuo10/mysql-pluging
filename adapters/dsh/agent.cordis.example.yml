@@ -1,0 +1,14 @@
+- id: mcp-mysql-agent
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: mysql
+    transport: stdio
+    command: mysql-agent-mcp
+    args: []
+    toolCallTimeoutMs: 60000
+    failOnStartupError: true
+    reconnect:
+      enabled: true
+      initialDelayMs: 500
+      maxDelayMs: 30000
+      maxAttempts: 10

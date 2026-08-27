@@ -1,0 +1,3 @@
+interface:
+  display_name: "MySQL Agent"
+  short_description: "Use managed MySQL test data sources"

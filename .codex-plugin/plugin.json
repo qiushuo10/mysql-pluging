@@ -1,0 +1,27 @@
+{
+  "name": "mysql-pluging",
+  "version": "0.2.1+codex.20260827162432",
+  "description": "Managed MySQL tools and fixed business operations for local agents",
+  "author": {
+    "name": "qiushuo10"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MySQL Agent Plugin",
+    "shortDescription": "Query and update managed MySQL test databases.",
+    "longDescription": "Adds managed MySQL connections, parameterized read and write tools, startup-loaded local business SQL packs, and audit history for Codex agents.",
+    "developerName": "qiushuo10",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u5217\u51fa\u5f53\u524d\u53ef\u7528\u7684 MySQL \u6570\u636e\u6e90\u3002",
+      "\u4f7f\u7528\u5408\u9002\u7684\u4e1a\u52a1\u64cd\u4f5c\u67e5\u8be2\u6d4b\u8bd5\u5e93\u3002",
+      "\u5148\u8bf4\u660e\u5f71\u54cd\u8303\u56f4\uff0c\u518d\u6267\u884c\u6d4b\u8bd5\u5e93\u6570\u636e\u53d8\u66f4\u3002"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

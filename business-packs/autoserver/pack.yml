@@ -1,0 +1,50 @@
+schema_version: mysql-agent/business-pack/1
+pack_id: autoserver
+version: 1.0.1
+operations:
+  - id: work_order.summary_since
+    domain: work_order
+    name: summary_since
+    title: 查询指定时间后的工单概览
+    description: 返回指定时间后创建的工单总数，以及按创建时间倒序排列的最近 5 条工单。
+    use_when: 用户询问某个时间之后有多少工单，并希望同时查看最近工单时使用。无需先查看表结构。
+    connections:
+      - auto-dev
+      - auto-prod
+    mode: read
+    exposure: domain
+    input:
+      created_after:
+        type: string
+        description: 查询起始时间，格式为 YYYY-MM-DD HH:mm:ss。
+        min_length: 19
+        max_length: 19
+        pattern: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$'
+    sql_file: sql/summary_since.sql
+    max_rows: 5
+    retry_safe: true
+    result_description: 每行包含 id、order_no、order_status、created_at 和相同的 total；无匹配工单时 rows 为空，表示总数为 0。
+
+  - id: work_order.trace_by_waybill_no
+    domain: work_order
+    name: trace_by_waybill_no
+    title: 按运单号查询工单全链路
+    description: 返回匹配工单、工单操作、流程实例与任务、KY 接收记录和出站推送记录的有界时间线。
+    use_when: 用户提供 KY waybill/third-party number 或 AutoServe order_no，并希望查看工单详情、处理过程、KY 接收及出站推送日志时使用。
+    connections:
+      - auto-dev
+      - auto-prod
+    mode: read
+    exposure: domain
+    input:
+      waybill_no:
+        type: string
+        description: KY 运单号、第三方编号或 AutoServe 工单号。
+        min_length: 1
+        max_length: 64
+        pattern: '.*\S.*'
+        trim: true
+    sql_file: sql/trace_by_waybill_no.sql
+    max_rows: 200
+    retry_safe: true
+    result_description: 每行以 section 区分工单、操作、流程、KY 接收和 KY 推送记录；data 为脱敏后的结构化 JSON，不包含凭据或大体积原始报文。
