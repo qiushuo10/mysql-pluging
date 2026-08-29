@@ -28,7 +28,13 @@ function argumentError(code: string, message: string): never {
 
 function validateScalar(value: unknown, name: string): asserts value is SqlScalar {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-  if (typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER) return;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (Math.abs(value) <= Number.MAX_SAFE_INTEGER) return;
+    argumentError(
+      'UNSAFE_INTEGER_PARAMETER',
+      `参数 ${name} 超出 JavaScript 安全整数范围；MySQL BIGINT、雪花 ID 等大整数必须从原始值按 JSON 字符串传入，例如 parameters.${name} = "<原始十进制字符串>"。当前数字可能已经丢失精度，插件不能自动还原。`,
+    );
+  }
   argumentError(
     'INVALID_PARAMETER_VALUE',
     `参数 ${name} 必须是字符串、安全整数、布尔值、null 或这些类型的一维数组。`,

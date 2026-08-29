@@ -1,6 +1,6 @@
 {
   "name": "mysql-pluging",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Local MySQL MCP plugin for Codex and DSH agents",
   "author": "qiushuo10",
   "license": "MIT",

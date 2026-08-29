@@ -5,11 +5,13 @@ import { ALIAS_PATTERN, MAX_AFFECTED_ROWS, MAX_MAX_ROWS, MAX_POOL_MAX } from '..
 const alias = z.string().regex(ALIAS_PATTERN).describe('已配置的数据源别名，例如 auto-dev。');
 const database = z.string().min(1).max(64).describe('默认 MySQL 数据库名。');
 const allowedDatabases = z.array(database).min(1).max(32).describe('该连接允许访问的数据库白名单。');
-const parameterScalar = z.union([z.string(), z.number().safe(), z.boolean(), z.null()]);
+// Keep the MCP schema broad enough for unsafe JSON numbers to reach the plugin's
+// actionable validation. compileNamedParameters rejects them before any SQL is sent.
+const parameterScalar = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const parameterValue = z.union([parameterScalar, z.array(parameterScalar).min(1).max(100)]);
 export const sqlParameters = z
   .record(z.string(), parameterValue)
-  .describe('命名参数对象。SQL 中用 :name 绑定标量，用 :...names 展开非空列表；值不得拼进 SQL 文本。');
+  .describe('命名参数对象。SQL 中用 :name 绑定标量，用 :...names 展开非空列表；值不得拼进 SQL 文本。MySQL BIGINT、雪花 ID 等可能超过 JavaScript 安全整数范围的值必须使用 JSON 字符串。');
 
 const connectionFields = {
   description: z.string().max(256).nullable().optional(),

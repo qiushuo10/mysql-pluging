@@ -352,7 +352,7 @@ function registerBaseTools(server: McpServer, store: StateStore, service: MysqlS
     {
       title: '执行参数化 MySQL 查询',
       description:
-        '执行一条只读 SQL。先选匹配的 business__* 工具；没有业务工具时才使用本入口。SQL 用 :name 绑定标量、:...names 展开列表，值放在 parameters。每个 SELECT（包括 COUNT）必须自带数字字面量 LIMIT，例如 COUNT 查询写 LIMIT 1；SHOW/DESCRIBE 不要求 LIMIT。',
+        '执行一条只读 SQL。先选匹配的 business__* 工具；没有业务工具时才使用本入口。SQL 用 :name 绑定标量、:...names 展开列表，值放在 parameters。MySQL BIGINT、雪花 ID 等大整数必须按 JSON 字符串传入，不能传 number。每个 SELECT（包括 COUNT）必须自带数字字面量 LIMIT，例如 COUNT 查询写 LIMIT 1；SHOW/DESCRIBE 不要求 LIMIT。',
       inputSchema: sqlQuerySchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -376,7 +376,7 @@ function registerBaseTools(server: McpServer, store: StateStore, service: MysqlS
     {
       title: '执行参数化 MySQL 写入',
       description:
-        '执行一条 INSERT、UPDATE 或 DELETE。SQL 用 :name 绑定标量、:...names 展开列表，值放在 parameters。UPDATE/DELETE 必须有引用字段的 WHERE，默认最多影响 100 行；写入发送后不会自动重试。',
+        '执行一条 INSERT、UPDATE 或 DELETE。SQL 用 :name 绑定标量、:...names 展开列表，值放在 parameters。MySQL BIGINT、雪花 ID 等大整数必须按 JSON 字符串传入，不能传 number。UPDATE/DELETE 必须有引用字段的 WHERE，默认最多影响 100 行；写入发送后不会自动重试。',
       inputSchema: sqlExecuteSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },

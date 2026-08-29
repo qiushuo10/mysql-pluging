@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { PluginError } from '../src/errors.js';
+import { sqlQuerySchema } from '../src/mcp/schemas.js';
 import { compileNamedParameters, containsExecutableComment, discoverNamedParameters } from '../src/sql/parameters.js';
 
 describe('compileNamedParameters', () => {
@@ -26,7 +27,22 @@ describe('compileNamedParameters', () => {
   });
 
   it('requires unsafe integers to be passed as strings', () => {
-    expect(() => compileNamedParameters('SELECT :id LIMIT 1', { id: Number.MAX_SAFE_INTEGER + 1 })).toThrow(/安全整数/);
+    const unsafeNumber = Number.MAX_SAFE_INTEGER + 1;
+    const parsed = sqlQuerySchema.parse({
+      connection: 'auto-dev',
+      sql: 'SELECT :id LIMIT 1',
+      parameters: { id: unsafeNumber },
+    });
+    expect(parsed.parameters.id).toBe(unsafeNumber);
+    try {
+      compileNamedParameters(parsed.sql, parsed.parameters);
+      throw new Error('expected unsafe integer validation to fail');
+    } catch (error) {
+      expect(error).toBeInstanceOf(PluginError);
+      expect(error).toMatchObject({ code: 'UNSAFE_INTEGER_PARAMETER', category: 'argument_error' });
+      expect((error as Error).message).toContain('按 JSON 字符串传入');
+      expect((error as Error).message).toContain('不能自动还原');
+    }
     expect(compileNamedParameters('SELECT :id LIMIT 1', { id: '9007199254740993' }).values).toEqual([
       '9007199254740993',
     ]);

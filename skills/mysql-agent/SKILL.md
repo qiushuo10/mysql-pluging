@@ -21,6 +21,7 @@ Set `refresh: true` on `schema_search` or `schema_describe` when the user requir
 ## SQL calls
 
 - Pass SQL structure in `sql` and values in `parameters`. Use `:name` for a scalar and `:...names` for a non-empty list. Never interpolate values into SQL text.
+- Pass MySQL `BIGINT`, snowflake IDs, and other potentially unsafe integers as JSON strings. Preserve string IDs returned by earlier tools; never convert them to numbers.
 - Every generic `SELECT`, including `COUNT`, must include a numeric literal `LIMIT` no larger than `max_rows`. Use `LIMIT 1` for a single aggregate row. `SHOW` and `DESCRIBE` do not require a limit.
 - Generic `UPDATE` and `DELETE` require a field-based `WHERE`; the plugin rolls back changes above the affected-row limit.
 - Do not emulate transactions across tool calls. Each call is independent.

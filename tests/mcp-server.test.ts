@@ -70,7 +70,31 @@ describe('MySQL MCP server', () => {
     expect(queryTool?.description).toContain(':name');
     expect(queryTool?.description).toContain('COUNT');
     expect(queryTool?.description).toContain('LIMIT 1');
+    expect(queryTool?.description).toContain('BIGINT');
+    expect(queryTool?.description).toContain('JSON 字符串');
     expect(JSON.stringify(queryTool?.inputSchema)).toContain('每个 SELECT');
+    expect(JSON.stringify(queryTool?.inputSchema)).toContain('JavaScript 安全整数范围');
+
+    const executeTool = tools.tools.find((tool) => tool.name === 'sql_execute');
+    expect(executeTool?.description).toContain('BIGINT');
+    expect(executeTool?.description).toContain('JSON 字符串');
+
+    const unsafeBigint = await client.callTool({
+      name: 'sql_query',
+      arguments: {
+        connection: 'auto-dev',
+        sql: 'SELECT :id LIMIT 1',
+        parameters: { id: Number.MAX_SAFE_INTEGER + 1 },
+      },
+    });
+    expect(unsafeBigint.isError).toBe(true);
+    expect(unsafeBigint.structuredContent).toEqual(expect.objectContaining({
+      category: 'argument_error',
+      code: 'UNSAFE_INTEGER_PARAMETER',
+      retryable: false,
+    }));
+    expect(JSON.stringify(unsafeBigint.content)).toContain('按 JSON 字符串传入');
+    expect(JSON.stringify(unsafeBigint.content)).not.toContain('CONNECTION_NOT_FOUND');
 
     const businessOperations = await client.callTool({ name: 'list_business_operations', arguments: { connection: 'auto-dev' } });
     expect(businessOperations.isError).toBe(false);

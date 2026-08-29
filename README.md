@@ -153,6 +153,18 @@ LIMIT 20
 
 通用 `SELECT` 必须包含不大于 `max_rows` 的字面量 `LIMIT`。通用 `UPDATE` 和 `DELETE` 必须包含字段条件 `WHERE`，并受影响行数上限约束。项目不支持通用 DDL、多语句或跨调用事务。
 
+MySQL `BIGINT`、雪花 ID 等可能超过 JavaScript 安全整数范围的值，必须在 `parameters` 中按 JSON 字符串传入：
+
+```json
+{
+  "parameters": {
+    "id": "2093644105678462977"
+  }
+}
+```
+
+不要把这类 ID 作为 JSON number 传入。数字一旦被 JavaScript 舍入，插件无法恢复原始尾数，因此会在 SQL 发送前返回 `UNSAFE_INTEGER_PARAMETER`，要求调用方从原始字符串重新取值。
+
 ## 业务包
 
 业务包用于把稳定业务查询发布成 Agent 能理解的固定能力。每个业务包位于 `business-packs/<pack>/`，包含一个 `pack.yml` 和若干 `.sql` 文件。
