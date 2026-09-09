@@ -1,6 +1,6 @@
 {
   "name": "mysql-pluging",
-  "version": "0.2.2+codex.20260829183108",
+  "version": "0.2.3+codex.20260909030547",
   "description": "Managed MySQL tools and fixed business operations for local agents",
   "author": {
     "name": "qiushuo10"

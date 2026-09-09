@@ -151,7 +151,7 @@ LIMIT 20
 }
 ```
 
-通用 `SELECT` 必须包含不大于 `max_rows` 的字面量 `LIMIT`。通用 `UPDATE` 和 `DELETE` 必须包含字段条件 `WHERE`，并受影响行数上限约束。项目不支持通用 DDL、多语句或跨调用事务。
+通用查询的 `max_rows` 默认值和最大值均为 1000。通用 `SELECT` 必须包含不大于 `max_rows` 的字面量 `LIMIT`。通用 `UPDATE` 和 `DELETE` 必须包含字段条件 `WHERE`，并受影响行数上限约束。项目不支持通用 DDL、多语句或跨调用事务。
 
 MySQL `BIGINT`、雪花 ID 等可能超过 JavaScript 安全整数范围的值，必须在 `parameters` 中按 JSON 字符串传入：
 

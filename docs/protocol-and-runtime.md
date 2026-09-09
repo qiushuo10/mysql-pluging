@@ -231,7 +231,7 @@ Server 先在 SQLite 短事务中删除配置，再阻止新调用借用该别�
 | `connection` | string | 是 | - | 连接别名 |
 | `sql` | string | 是 | - | 单条只读 SQL |
 | `parameters` | object | 否 | `{}` | 命名参数 |
-| `max_rows` | integer | 否 | `200` | 1–1000；不能超过服务端上限 |
+| `max_rows` | integer | 否 | `1000` | 1–1000；不能超过服务端上限 |
 | `timeout_ms` | integer | 否 | 连接默认值 | 100–连接配置上限 |
 
 允许的根语句：`SELECT`、`SHOW`、`DESCRIBE`、`DESC` 和 `EXPLAIN`。`WITH` 必须解析到只读根语句。`SHOW` 只允许查看目标连接允许数据库内的表、字段、索引和状态，不开放 `SHOW DATABASES`。禁止 `SELECT ... INTO OUTFILE`、锁定读、存储过程调用和多语句。

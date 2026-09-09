@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { ALIAS_PATTERN, MAX_AFFECTED_ROWS, MAX_MAX_ROWS, MAX_POOL_MAX } from '../constants.js';
+import { ALIAS_PATTERN, DEFAULT_MAX_ROWS, MAX_AFFECTED_ROWS, MAX_MAX_ROWS, MAX_POOL_MAX } from '../constants.js';
 
 const alias = z.string().regex(ALIAS_PATTERN).describe('已配置的数据源别名，例如 auto-dev。');
 const database = z.string().min(1).max(64).describe('默认 MySQL 数据库名。');
@@ -78,7 +78,7 @@ export const sqlQuerySchema = z
       .max(65_536)
       .describe('单条只读 SQL。每个 SELECT（包括 COUNT）必须包含数字字面量 LIMIT；COUNT 通常使用 LIMIT 1。SHOW/DESCRIBE 不要求 LIMIT。'),
     parameters: sqlParameters.default({}),
-    max_rows: z.number().int().min(1).max(MAX_MAX_ROWS).default(200).describe('允许返回的最大行数；SQL 中的 LIMIT 不能超过该值。'),
+    max_rows: z.number().int().min(1).max(MAX_MAX_ROWS).default(DEFAULT_MAX_ROWS).describe('允许返回的最大行数，默认 1000；SQL 中的 LIMIT 不能超过该值。'),
     timeout_ms: z.number().int().min(100).max(300_000).optional().describe('本次调用超时，不能超过数据源配置上限。'),
   })
   .strict();
