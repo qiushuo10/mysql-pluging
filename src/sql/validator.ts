@@ -7,6 +7,7 @@ import type { StatementKind } from '../types.js';
 import { containsExecutableComment } from './parameters.js';
 
 type AstNode = Record<string, unknown>;
+type LexerState = 'normal' | 'single' | 'double' | 'backtick' | 'line_comment' | 'block_comment';
 
 export interface SqlValidation {
   kind: StatementKind;
@@ -26,9 +27,211 @@ const FORBIDDEN_READ_FUNCTIONS = new Set([
   'RELEASE_LOCK',
   'SLEEP',
 ]);
+const JSON_TABLE_NAME = 'JSON_TABLE';
+const JSON_TABLE_SOURCE_ALIAS = '__mysql_agent_json_table_source';
 
 function reject(code: string, message: string): never {
   throw new PluginError({ category: 'argument_error', code, message });
+}
+
+function isIdentifierCharacter(char: string): boolean {
+  return /[A-Za-z0-9_$\u0080-\uFFFF]/u.test(char);
+}
+
+function hasKeywordAt(sql: string, index: number, keyword: string): boolean {
+  if (sql.slice(index, index + keyword.length).toUpperCase() !== keyword) return false;
+  const previous = sql[index - 1] ?? '';
+  const next = sql[index + keyword.length] ?? '';
+  return (!previous || !isIdentifierCharacter(previous)) && (!next || !isIdentifierCharacter(next));
+}
+
+function skipTrivia(sql: string, start: number): number {
+  let index = start;
+  while (index < sql.length) {
+    if (/\s/.test(sql[index] ?? '')) {
+      index += 1;
+      continue;
+    }
+    if (sql[index] === '/' && sql[index + 1] === '*') {
+      const end = sql.indexOf('*/', index + 2);
+      return end === -1 ? sql.length : skipTrivia(sql, end + 2);
+    }
+    if (sql[index] === '#' || (sql[index] === '-' && sql[index + 1] === '-' && /\s/.test(sql[index + 2] ?? ''))) {
+      const end = sql.indexOf('\n', index + 1);
+      return end === -1 ? sql.length : skipTrivia(sql, end + 1);
+    }
+    break;
+  }
+  return index;
+}
+
+interface JsonTableCall {
+  closeIndex: number;
+  sourceExpression: string;
+}
+
+function scanJsonTableCall(sql: string, openIndex: number): JsonTableCall | null {
+  let state: LexerState = 'normal';
+  let depth = 1;
+  let firstComma = -1;
+  let hasColumnsClause = false;
+
+  for (let index = openIndex + 1; index < sql.length; index += 1) {
+    const char = sql[index] ?? '';
+    const next = sql[index + 1] ?? '';
+
+    if (state === 'single' || state === 'double' || state === 'backtick') {
+      const delimiter = state === 'single' ? "'" : state === 'double' ? '"' : '`';
+      if (char === '\\' && state !== 'backtick' && next) {
+        index += 1;
+      } else if (char === delimiter && next === delimiter) {
+        index += 1;
+      } else if (char === delimiter) {
+        state = 'normal';
+      }
+      continue;
+    }
+    if (state === 'line_comment') {
+      if (char === '\n') state = 'normal';
+      continue;
+    }
+    if (state === 'block_comment') {
+      if (char === '*' && next === '/') {
+        index += 1;
+        state = 'normal';
+      }
+      continue;
+    }
+
+    if (char === "'") {
+      state = 'single';
+      continue;
+    }
+    if (char === '"') {
+      state = 'double';
+      continue;
+    }
+    if (char === '`') {
+      state = 'backtick';
+      continue;
+    }
+    if (char === '#') {
+      state = 'line_comment';
+      continue;
+    }
+    if (char === '-' && next === '-' && /\s/.test(sql[index + 2] ?? '')) {
+      state = 'line_comment';
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      state = 'block_comment';
+      index += 1;
+      continue;
+    }
+    if (char === ';') return null;
+    if (char === '(') {
+      depth += 1;
+      continue;
+    }
+    if (char === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        if (firstComma === -1 || !hasColumnsClause) return null;
+        const sourceExpression = sql.slice(openIndex + 1, firstComma).trim();
+        return sourceExpression ? { closeIndex: index, sourceExpression } : null;
+      }
+      continue;
+    }
+    if (depth === 1 && char === ',' && firstComma === -1) {
+      firstComma = index;
+      continue;
+    }
+    if (depth === 1 && firstComma !== -1 && hasKeywordAt(sql, index, 'COLUMNS')) {
+      const columnsOpen = skipTrivia(sql, index + 'COLUMNS'.length);
+      if (sql[columnsOpen] === '(') hasColumnsClause = true;
+    }
+  }
+  return null;
+}
+
+/**
+ * node-sql-parser 5.4 cannot parse MySQL 8 JSON_TABLE table functions. Rewrite only
+ * the parser copy to a derived table while preserving the source expression so
+ * forbidden functions, nested reads, and cross-database references remain visible
+ * to the existing AST safety checks. The original SQL is still sent to MySQL.
+ */
+function sqlForParser(sql: string): string {
+  let state: LexerState = 'normal';
+  let output = '';
+  let cursor = 0;
+
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index] ?? '';
+    const next = sql[index + 1] ?? '';
+
+    if (state === 'single' || state === 'double' || state === 'backtick') {
+      const delimiter = state === 'single' ? "'" : state === 'double' ? '"' : '`';
+      if (char === '\\' && state !== 'backtick' && next) {
+        index += 1;
+      } else if (char === delimiter && next === delimiter) {
+        index += 1;
+      } else if (char === delimiter) {
+        state = 'normal';
+      }
+      continue;
+    }
+    if (state === 'line_comment') {
+      if (char === '\n') state = 'normal';
+      continue;
+    }
+    if (state === 'block_comment') {
+      if (char === '*' && next === '/') {
+        index += 1;
+        state = 'normal';
+      }
+      continue;
+    }
+
+    if (char === "'") {
+      state = 'single';
+      continue;
+    }
+    if (char === '"') {
+      state = 'double';
+      continue;
+    }
+    if (char === '`') {
+      state = 'backtick';
+      continue;
+    }
+    if (char === '#') {
+      state = 'line_comment';
+      continue;
+    }
+    if (char === '-' && next === '-' && /\s/.test(sql[index + 2] ?? '')) {
+      state = 'line_comment';
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      state = 'block_comment';
+      index += 1;
+      continue;
+    }
+
+    if (!hasKeywordAt(sql, index, JSON_TABLE_NAME)) continue;
+    const openIndex = skipTrivia(sql, index + JSON_TABLE_NAME.length);
+    if (sql[openIndex] !== '(') continue;
+    const call = scanJsonTableCall(sql, openIndex);
+    if (!call) continue;
+
+    output += sql.slice(cursor, index);
+    output += `(SELECT ${call.sourceExpression} AS ${JSON_TABLE_SOURCE_ALIAS})`;
+    cursor = call.closeIndex + 1;
+    index = call.closeIndex;
+  }
+  return output + sql.slice(cursor);
 }
 
 function parse(sql: string): AstNode {
@@ -41,7 +244,7 @@ function parse(sql: string): AstNode {
     reject('EXECUTABLE_COMMENT_FORBIDDEN', '不允许 MySQL 或 MariaDB 可执行注释。');
   }
   try {
-    const ast = parser.astify(sql, { database: 'MySQL' }) as unknown;
+    const ast = parser.astify(sqlForParser(sql), { database: 'MySQL' }) as unknown;
     if (Array.isArray(ast)) reject('MULTIPLE_STATEMENTS', '一次只能执行一条 SQL。');
     if (!ast || typeof ast !== 'object') reject('UNSUPPORTED_SQL', '无法识别当前 SQL。');
     return ast as AstNode;
@@ -59,7 +262,7 @@ function parse(sql: string): AstNode {
 function tablesFor(sql: string, allowedDatabases: string[]): string[] {
   let tableList: string[];
   try {
-    tableList = parser.tableList(sql, { database: 'MySQL' });
+    tableList = parser.tableList(sqlForParser(sql), { database: 'MySQL' });
   } catch (error) {
     throw new PluginError({
       category: 'argument_error',

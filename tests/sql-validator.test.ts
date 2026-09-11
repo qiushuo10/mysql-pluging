@@ -41,6 +41,51 @@ describe('SQL validation', () => {
     ).toThrow(/不允许访问数据库 prod/);
   });
 
+  it('supports MySQL 8 JSON_TABLE reads without weakening AST safety checks', () => {
+    const sql = `
+      SELECT
+        COUNT(*) AS link_count,
+        COUNT(DISTINCT JSON_UNQUOTE(JSON_EXTRACT(ref.j, '$.caseKey'))) AS distinct_baseline_cases
+      FROM asset_nodes n
+      JOIN JSON_TABLE(
+        n.metadata_json,
+        '$.relatedBaselineCases[*]' COLUMNS (j JSON PATH '$')
+      ) ref ON TRUE
+      WHERE n.created_in_version_id = ? AND n.type = 'CASE'
+      LIMIT 1
+    `;
+    expect(validateQuerySql(sql, ['auto_server_fat'], 1)).toEqual({
+      kind: 'select',
+      tables: ['asset_nodes'],
+    });
+
+    expect(() => validateQuerySql(sql.replace('LIMIT 1', ''), ['auto_server_fat'], 1)).toThrow(/LIMIT/);
+    expect(() => validateQuerySql(
+      "SELECT * FROM JSON_TABLE(LOAD_FILE('/tmp/input.json'), '$[*]' COLUMNS (j JSON PATH '$')) ref LIMIT 1",
+      ['auto_server_fat'],
+      1,
+    )).toThrow(/LOAD_FILE/);
+    expect(() => validateQuerySql(
+      "SELECT * FROM JSON_TABLE((SELECT payload FROM prod.secrets LIMIT 1), '$[*]' COLUMNS (j JSON PATH '$')) ref LIMIT 1",
+      ['auto_server_fat'],
+      1,
+    )).toThrow(/不允许访问数据库 prod/);
+    expect(() => validateQuerySql(
+      "SELECT * FROM JSON_TABLE(doc, '$[*]' COLUMNS (j JSON PATH '$')) ref; SELECT 2 LIMIT 1",
+      ['auto_server_fat'],
+      1,
+    )).toThrow(/一条 SQL/);
+  });
+
+  it('does not rewrite JSON_TABLE text in literals or malformed calls', () => {
+    expect(validateQuerySql("SELECT 'JSON_TABLE(doc)' AS sample LIMIT 1", ['app'], 1).kind).toBe('select');
+    expect(() => validateQuerySql(
+      "SELECT * FROM JSON_TABLE(doc, '$[*]') ref LIMIT 1",
+      ['app'],
+      1,
+    )).toThrow(expect.objectContaining({ code: 'SQL_PARSE_ERROR' }));
+  });
+
   it('allows INSERT and field-bounded UPDATE/DELETE only', () => {
     expect(validateWriteSql('INSERT INTO orders(order_no) VALUES (?)', ['auto_server_fat']).kind).toBe('insert');
     expect(validateWriteSql('UPDATE orders SET status = ? WHERE id = ?', ['auto_server_fat']).kind).toBe('update');
