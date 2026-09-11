@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { PluginError, mapMysqlError } from '../src/errors.js';
+import { PluginError, mapMysqlError, sanitizeMysqlMessage } from '../src/errors.js';
 import { normalizeWritePluginError } from '../src/mysql/service.js';
 
 describe('write outcome mapping', () => {
@@ -26,9 +26,37 @@ describe('write outcome mapping', () => {
   });
 
   it('keeps explicit MySQL failures known', () => {
-    const mysqlError = Object.assign(new Error('duplicate'), { errno: 1062, code: 'ER_DUP_ENTRY' });
+    const mysqlError = Object.assign(new Error('duplicate'), {
+      errno: 1062,
+      code: 'ER_DUP_ENTRY',
+      sqlState: '23000',
+      sqlMessage: "Duplicate entry 'private-value' for key 'uk_account'",
+    });
     const error = mapMysqlError(mysqlError, 'auto-fat', 'known_failed', 1);
     expect(error.category).toBe('sql_error');
     expect(error.writeOutcome).toBe('known_failed');
+    expect(error.mysqlErrorName).toBe('ER_DUP_ENTRY');
+    expect(error.mysqlMessage).toBe("Duplicate entry '[REDACTED]' for key 'uk_account'");
+  });
+
+  it('preserves actionable MySQL diagnostics and redacts bound values', () => {
+    const mysqlError = Object.assign(new Error('bad field'), {
+      errno: 1054,
+      code: 'ER_BAD_FIELD_ERROR',
+      sqlState: '42S22',
+      sqlMessage: "Unknown column 'e.deleted' in 'where clause'",
+    });
+    const error = mapMysqlError(mysqlError, 'auto-fat', 'not_applicable', 1);
+    expect(error).toMatchObject({
+      mysqlCode: 1054,
+      mysqlErrorName: 'ER_BAD_FIELD_ERROR',
+      mysqlMessage: "Unknown column 'e.deleted' in 'where clause'",
+      sqlState: '42S22',
+    });
+
+    expect(sanitizeMysqlMessage(
+      "Incorrect integer value: 'private-value' for column 'tenant_id' at row 1",
+      ['private-value'],
+    )).toBe("Incorrect integer value: '[REDACTED]' for column 'tenant_id' at row 1");
   });
 });

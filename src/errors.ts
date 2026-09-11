@@ -20,6 +20,8 @@ export interface PluginErrorOptions {
   retryAfterMs?: number;
   writeOutcome?: WriteOutcome;
   mysqlCode?: number;
+  mysqlErrorName?: string;
+  mysqlMessage?: string;
   sqlState?: string;
   attemptCount?: number;
   cause?: unknown;
@@ -32,6 +34,8 @@ export class PluginError extends Error {
   readonly retryAfterMs: number | null;
   readonly writeOutcome: WriteOutcome;
   readonly mysqlCode: number | null;
+  readonly mysqlErrorName: string | null;
+  readonly mysqlMessage: string | null;
   readonly sqlState: string | null;
   readonly attemptCount: number;
 
@@ -44,6 +48,8 @@ export class PluginError extends Error {
     this.retryAfterMs = options.retryAfterMs ?? null;
     this.writeOutcome = options.writeOutcome ?? 'not_applicable';
     this.mysqlCode = options.mysqlCode ?? null;
+    this.mysqlErrorName = options.mysqlErrorName ?? null;
+    this.mysqlMessage = options.mysqlMessage ?? null;
     this.sqlState = options.sqlState ?? null;
     this.attemptCount = options.attemptCount ?? 1;
   }
@@ -52,8 +58,35 @@ export class PluginError extends Error {
 export interface MysqlLikeError extends Error {
   code?: string;
   errno?: number;
+  sqlMessage?: string;
   sqlState?: string;
   fatal?: boolean;
+}
+
+const MYSQL_MESSAGE_MAX_CHARS = 1_000;
+
+function normalizedParameterValues(values: readonly unknown[]): Set<string> {
+  const output = new Set<string>();
+  for (const value of values) {
+    if (value === null || value === undefined || typeof value === 'object') continue;
+    output.add(String(value));
+  }
+  return output;
+}
+
+/** Returns a bounded, single-line MySQL diagnostic without echoing bound values. */
+export function sanitizeMysqlMessage(message: string, boundValues: readonly unknown[] = []): string {
+  const parameterValues = normalizedParameterValues(boundValues);
+  const redacted = message
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/Duplicate entry '.*?' for key/gi, "Duplicate entry '[REDACTED]' for key")
+    .replace(/'((?:''|\\.|[^'])*)'/g, (quoted, value: string) =>
+      parameterValues.has(value) ? "'[REDACTED]'" : quoted,
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (redacted.length <= MYSQL_MESSAGE_MAX_CHARS) return redacted;
+  return `${redacted.slice(0, MYSQL_MESSAGE_MAX_CHARS - 1)}…`;
 }
 
 const TRANSIENT_CODES = new Set([
@@ -86,11 +119,13 @@ export function mapMysqlError(
   connection: string,
   writeOutcome: WriteOutcome,
   attemptCount: number,
+  boundValues: readonly unknown[] = [],
 ): PluginError {
   if (error instanceof PluginError) return error;
 
   const mysqlError = asMysqlError(error);
   const mysqlCode = mysqlError?.errno;
+  const mysqlErrorName = mysqlError?.code;
   const sqlState = mysqlError?.sqlState;
   const transient = isTransientMysqlError(error);
 
@@ -101,6 +136,7 @@ export function mapMysqlError(
       message: `数据源 ${connection} 认证失败。`,
       writeOutcome,
       mysqlCode,
+      mysqlErrorName,
       sqlState,
       attemptCount,
       cause: error,
@@ -114,6 +150,7 @@ export function mapMysqlError(
       message: `数据源 ${connection} 拒绝了当前数据库操作。`,
       writeOutcome,
       mysqlCode,
+      mysqlErrorName,
       sqlState,
       attemptCount,
       cause: error,
@@ -132,6 +169,7 @@ export function mapMysqlError(
       retryAfterMs: unknownWrite ? undefined : 250,
       writeOutcome,
       mysqlCode,
+      mysqlErrorName,
       sqlState,
       attemptCount,
       cause: error,
@@ -144,6 +182,10 @@ export function mapMysqlError(
     message: 'MySQL 拒绝了当前 SQL，请检查语法、约束和字段。',
     writeOutcome,
     mysqlCode,
+    mysqlErrorName,
+    mysqlMessage: mysqlError?.sqlMessage
+      ? sanitizeMysqlMessage(mysqlError.sqlMessage, boundValues)
+      : undefined,
     sqlState,
     attemptCount,
     cause: error,

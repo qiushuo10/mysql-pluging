@@ -153,7 +153,7 @@ export class MysqlService {
       return result;
     } catch (error) {
       if (config && isSchemaDriftError(error)) this.schema.invalidate(config.alias, config.revision);
-      const pluginError = this.mapExecutionError(error, request.connection, false, attemptCount);
+      const pluginError = this.mapExecutionError(error, request.connection, false, attemptCount, false, compiled.values);
       const durationMs = Math.round(performance.now() - started);
       this.auditError(executionId, request, config, kind, sqlHash, durationMs, pluginError);
       throw Object.assign(pluginError, { executionId });
@@ -253,7 +253,7 @@ export class MysqlService {
       return result;
     } catch (error) {
       if (config && isSchemaDriftError(error)) this.schema.invalidate(config.alias, config.revision);
-      const pluginError = this.mapExecutionError(error, request.connection, true, attemptCount, writeSent);
+      const pluginError = this.mapExecutionError(error, request.connection, true, attemptCount, writeSent, compiled.values);
       const durationMs = Math.round(performance.now() - started);
       this.auditError(executionId, request, config, kind, sqlHash, durationMs, pluginError);
       throw Object.assign(pluginError, { executionId });
@@ -295,6 +295,7 @@ export class MysqlService {
     write: boolean,
     attempts: number,
     writeSent = false,
+    boundValues: readonly unknown[] = [],
   ): PluginError {
     if (error instanceof PluginError) return write ? normalizeWritePluginError(error, connection, writeSent) : error;
     if (error instanceof DatabaseAttemptError) {
@@ -306,7 +307,7 @@ export class MysqlService {
             : 'known_failed'
           : 'not_sent'
         : 'not_applicable';
-      return mapMysqlError(error.original, connection, writeOutcome, attemptCount);
+      return mapMysqlError(error.original, connection, writeOutcome, attemptCount, boundValues);
     }
     return unknownError(error);
   }
@@ -422,6 +423,8 @@ export function normalizeWritePluginError(error: PluginError, connection: string
     retryAfterMs: error.retryAfterMs ?? undefined,
     writeOutcome: sent ? 'unknown' : 'not_sent',
     mysqlCode: error.mysqlCode ?? undefined,
+    mysqlErrorName: error.mysqlErrorName ?? undefined,
+    mysqlMessage: error.mysqlMessage ?? undefined,
     sqlState: error.sqlState ?? undefined,
     attemptCount: error.attemptCount,
     cause: error,

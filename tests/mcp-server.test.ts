@@ -7,6 +7,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createMysqlMcpApplication } from '../src/mcp/server.js';
+import { mapMysqlError } from '../src/errors.js';
 
 const homes: string[] = [];
 
@@ -95,6 +96,33 @@ describe('MySQL MCP server', () => {
     }));
     expect(JSON.stringify(unsafeBigint.content)).toContain('按 JSON 字符串传入');
     expect(JSON.stringify(unsafeBigint.content)).not.toContain('CONNECTION_NOT_FOUND');
+
+    application.service.query = async () => {
+      const mysqlError = Object.assign(new Error('bad field'), {
+        errno: 1054,
+        code: 'ER_BAD_FIELD_ERROR',
+        sqlState: '42S22',
+        sqlMessage: "Unknown column 'e.deleted' in 'where clause'",
+      });
+      throw mapMysqlError(mysqlError, 'auto-dev', 'not_applicable', 1);
+    };
+    const mysqlFailure = await client.callTool({
+      name: 'sql_query',
+      arguments: { connection: 'auto-dev', sql: 'SELECT e.deleted FROM employee e LIMIT 1' },
+    });
+    expect(mysqlFailure.isError).toBe(true);
+    expect(mysqlFailure.structuredContent).toEqual(expect.objectContaining({
+      code: 'MYSQL_SQL_ERROR',
+      message: "Unknown column 'e.deleted' in 'where clause'",
+      mysql_code: 1054,
+      mysql_error_name: 'ER_BAD_FIELD_ERROR',
+      mysql_message: "Unknown column 'e.deleted' in 'where clause'",
+      sql_state: '42S22',
+    }));
+    expect(JSON.stringify(mysqlFailure.content)).toContain("Unknown column 'e.deleted' in 'where clause'");
+    expect(JSON.stringify(mysqlFailure.content)).toContain('ER_BAD_FIELD_ERROR');
+    expect(JSON.stringify(mysqlFailure.content)).toContain('errno 1054');
+    expect(JSON.stringify(mysqlFailure.content)).toContain('SQLSTATE 42S22');
 
     const businessOperations = await client.callTool({ name: 'list_business_operations', arguments: { connection: 'auto-dev' } });
     expect(businessOperations.isError).toBe(false);

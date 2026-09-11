@@ -420,6 +420,8 @@ BIGINT、DECIMAL 等不能安全表示为 JSON number 的值统一返回字符�
   "retry_after_ms": 250,
   "attempt_count": 2,
   "mysql_code": null,
+  "mysql_error_name": null,
+  "mysql_message": null,
   "sql_state": null
 }
 ```
@@ -432,7 +434,9 @@ BIGINT、DECIMAL 等不能安全表示为 JSON number 的值统一返回字符�
 - `committed`：MySQL 明确返回成功。
 - `unknown`：发送后断链、超时或取消，无法确认是否生效。
 
-`category` 取值：`argument_error`、`config_error`、`connection_error`、`authentication_error`、`timeout`、`sql_error`、`permission_error`、`result_limit`、`write_outcome_unknown` 和 `internal_error`。`code` 是插件定义的稳定代码；`mysql_code` 和 `sql_state` 只在 MySQL 返回对应信息时出现。
+`category` 取值：`argument_error`、`config_error`、`connection_error`、`authentication_error`、`timeout`、`sql_error`、`permission_error`、`result_limit`、`write_outcome_unknown` 和 `internal_error`。`code` 是插件定义的稳定代码；`mysql_code`、`mysql_error_name` 和 `sql_state` 只在 MySQL 返回对应信息时出现。`mysql_message` 返回经过单行化、长度限制和参数值脱敏的具体 MySQL 失败原因；MCP 文本正文也携带这组诊断信息，确保不展示 `structuredContent` 的客户端仍能给 Agent 明确原因。
+
+对于 MySQL SQL 错误，顶层 `message` 同样使用具体的脱敏原因，而不是宽泛提示。例如：`Unknown column 'e.deleted' in 'where clause'`。
 
 错误结果不返回密码、完整连接串、绑定参数值或完整 SQL。
 

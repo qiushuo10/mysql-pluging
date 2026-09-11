@@ -94,22 +94,31 @@ function success(text: string, data: Record<string, unknown>): CallToolResult {
 function failure(error: unknown): CallToolResult {
   const pluginError = unknownError(error);
   const executionId = (pluginError as PluginError & { executionId?: string }).executionId ?? randomUUID();
+  const mysqlIdentity = [
+    pluginError.mysqlErrorName,
+    pluginError.mysqlCode === null ? null : `errno ${pluginError.mysqlCode}`,
+    pluginError.sqlState === null ? null : `SQLSTATE ${pluginError.sqlState}`,
+  ].filter((value): value is string => value !== null).join(', ');
+  const reason = pluginError.mysqlMessage ?? pluginError.message;
+  const diagnostic = mysqlIdentity ? `${reason} (${mysqlIdentity})` : reason;
   const structuredContent: Record<string, unknown> = {
     schema_version: 'mysql-agent/result/1',
     execution_id: executionId,
     status: 'error',
     category: pluginError.category,
     code: pluginError.code,
-    message: pluginError.message,
+    message: reason,
     retryable: pluginError.retryable,
     write_outcome: pluginError.writeOutcome,
     retry_after_ms: pluginError.retryAfterMs,
     attempt_count: pluginError.attemptCount,
     mysql_code: pluginError.mysqlCode,
+    mysql_error_name: pluginError.mysqlErrorName,
+    mysql_message: pluginError.mysqlMessage,
     sql_state: pluginError.sqlState,
   };
   return {
-    content: [{ type: 'text', text: `${pluginError.code}: ${pluginError.message}` }],
+    content: [{ type: 'text', text: `${pluginError.code}: ${diagnostic}` }],
     structuredContent,
     isError: true,
   };
@@ -511,7 +520,7 @@ export function createMysqlMcpApplication(options: {
   const businessRegistry = new BusinessOperationRegistry(loaded.operations);
   const store = new StateStore(options.stateHome);
   const service = new MysqlService(store, undefined, options.schemaLoader);
-  const server = new McpServer({ name: 'mysql-agent', version: '0.2.0' });
+  const server = new McpServer({ name: 'mysql-agent', version: '0.2.4' });
   registerBaseTools(server, store, service, businessRegistry);
   registerBusinessTools(server, service, businessRegistry);
   return {
