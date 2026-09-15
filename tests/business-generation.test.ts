@@ -74,4 +74,80 @@ describe('RegistryGenerationManager', () => {
     expect(manager.snapshot().id).toBe(2);
     await manager.close();
   });
+
+  it('waits for active leases before shutdown closes their registries', async () => {
+    let closed = 0;
+    let shutdownFinished = false;
+    const manager = new RegistryGenerationManager(registry(() => { closed += 1; }));
+    const lease = manager.acquire();
+    const shutdown = manager.close().then(() => { shutdownFinished = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closed).toBe(0);
+    expect(shutdownFinished).toBe(false);
+    expect(() => manager.acquire()).toThrow(/closing/);
+    await expect(manager.serializedReload(async () => ({
+      registry: registry(() => undefined), value: null,
+    }))).rejects.toThrow(/closing/);
+    lease.release();
+    await shutdown;
+    expect(closed).toBe(1);
+  });
+
+  it('does not force-close SQL or script leases when a shutdown deadline elapses', async () => {
+    let closed = 0;
+    const manager = new RegistryGenerationManager(registry(() => { closed += 1; }));
+    const sqlLease = manager.acquire();
+    const scriptLease = manager.acquire();
+    const shutdown = manager.close();
+    const deadline = await Promise.race([
+      shutdown.then(() => 'closed'),
+      new Promise<'deadline'>((resolve) => setTimeout(() => resolve('deadline'), 20)),
+    ]);
+    expect(deadline).toBe('deadline');
+    expect(closed).toBe(0);
+    sqlLease.release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closed).toBe(0);
+    scriptLease.release();
+    await shutdown;
+    expect(closed).toBe(1);
+  });
+
+  it('allows an already-started reload to finish before shutdown retires its result', async () => {
+    const order: string[] = [];
+    let releasePrepare!: () => void;
+    const prepareBlocked = new Promise<void>((resolve) => { releasePrepare = resolve; });
+    const manager = new RegistryGenerationManager(registry(() => { order.push('initial-close'); }));
+    const reload = manager.serializedReload(async () => {
+      order.push('prepare');
+      await prepareBlocked;
+      return { registry: registry(() => { order.push('candidate-close'); }), value: null };
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const shutdown = manager.close();
+    await expect(manager.serializedReload(async () => ({
+      registry: registry(() => undefined), value: null,
+    }))).rejects.toThrow(/closing/);
+    releasePrepare();
+    await reload;
+    await shutdown;
+    expect(order).toEqual(['prepare', 'initial-close', 'candidate-close']);
+  });
+
+  it('does not close a leased retired generation during shutdown', async () => {
+    let oldClosed = 0;
+    let currentClosed = 0;
+    const manager = new RegistryGenerationManager(registry(() => { oldClosed += 1; }));
+    const oldLease = manager.acquire();
+    await manager.serializedReload(async () => ({
+      registry: registry(() => { currentClosed += 1; }), value: null,
+    }));
+    const shutdown = manager.close();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(oldClosed).toBe(0);
+    expect(currentClosed).toBe(1);
+    oldLease.release();
+    await shutdown;
+    expect(oldClosed).toBe(1);
+  });
 });

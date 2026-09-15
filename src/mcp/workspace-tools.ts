@@ -936,15 +936,12 @@ function registerWorkspaceManagementTools(
   }, () => safe(async () => {
     const candidateHolder: { value?: BusinessOperationRegistry } = {};
     try {
-      const swapped = await generations.serializedReload(async () => {
-        const oldLease = generations.acquire();
+      const swapped = await generations.serializedReload(async (current) => {
         let oldSchemaSurface: Map<string, string>;
         let oldCatalogSurface: Map<string, string>;
         const targets = workspaceTargets(manager, store);
-        try {
-          oldSchemaSurface = workspaceBusinessSurface(oldLease.registry, store, targets);
-          oldCatalogSurface = workspaceBusinessCatalogSurface(oldLease.registry, store, targets);
-        } finally { oldLease.release(); }
+        oldSchemaSurface = workspaceBusinessSurface(current.registry, store, targets);
+        oldCatalogSurface = workspaceBusinessCatalogSurface(current.registry, store, targets);
         const loaded = loadBusinessOperationsFromHomes(manager.context.businessPackPaths, { workspace: manager.context });
         const candidate = new BusinessOperationRegistry(loaded.operations);
         candidateHolder.value = candidate;
@@ -965,13 +962,23 @@ function registerWorkspaceManagementTools(
           return previous !== undefined && previous !== nextCatalogSurface.get(name);
         });
         const staged = new Map<string, RegisteredTool>();
+        const newlyRegistered = new Set<string>();
         const metadataRollbacks: Array<() => void> = [];
         const cleanupStaged = () => {
           for (const [name, handle] of staged) {
+            if (!newlyRegistered.has(name)) {
+              try { handle.disable(); } catch { /* already disabled */ }
+              continue;
+            }
             try { reloadHooks.removeTool ? reloadHooks.removeTool(name, () => handle.remove()) : handle.remove(); }
-            catch { /* staged tools were never enabled; best effort cleanup is safe */ }
+            catch {
+              // A hook can mutate and then throw, or throw before mutation. The SDK
+              // remove operation is idempotent, so always force the local cleanup.
+              try { handle.remove(); } catch { /* best effort */ }
+            }
           }
           staged.clear();
+          newlyRegistered.clear();
         };
         try {
           for (const name of updatedNames) {
@@ -980,22 +987,37 @@ function registerWorkspaceManagementTools(
             if (!handle || !descriptor) throw configError('BUSINESS_TOOL_HANDLE_MISSING', `工具 ${name} 缺少活动注册句柄。`);
             const previous = { title: handle.title, description: handle.description, annotations: handle.annotations };
             const update = () => handle.update({ title: descriptor.title, description: descriptor.description, annotations: descriptor.annotations });
-            reloadHooks.updateTool ? reloadHooks.updateTool(name, update) : update();
+            // Register compensation before invoking an injectable mutation: a hook may
+            // perform the update and only then throw.
             metadataRollbacks.push(() => handle.update(previous));
+            reloadHooks.updateTool ? reloadHooks.updateTool(name, update) : update();
           }
           for (const name of addedNames) {
             const stale = businessHandles.get(name);
-            if (stale) {
-              const remove = () => stale.remove();
-              reloadHooks.removeTool ? reloadHooks.removeTool(name, remove) : remove();
-              businessHandles.delete(name);
-              names.delete(name);
-            }
             const descriptor = nextDescriptors.get(name)!;
-            const register = () => registerDynamicBusinessTool({
-              server, descriptor, generations, manager, store, service, getClientName, recorder,
-            });
-            const handle = reloadHooks.stageTool ? reloadHooks.stageTool(name, register) : register();
+            let handle: RegisteredTool;
+            if (stale) {
+              const previous = {
+                title: stale.title, description: stale.description,
+                inputSchema: stale.inputSchema, annotations: stale.annotations,
+              };
+              metadataRollbacks.push(() => stale.update({
+                title: previous.title, description: previous.description,
+                paramsSchema: (previous.inputSchema as z.ZodObject).shape, annotations: previous.annotations,
+              }));
+              const update = () => stale.update({
+                title: descriptor.title, description: descriptor.description,
+                paramsSchema: (descriptor.inputSchema as z.ZodObject).shape, annotations: descriptor.annotations,
+              });
+              reloadHooks.updateTool ? reloadHooks.updateTool(name, update) : update();
+              handle = stale;
+            } else {
+              const register = () => registerDynamicBusinessTool({
+                server, descriptor, generations, manager, store, service, getClientName, recorder,
+              });
+              handle = reloadHooks.stageTool ? reloadHooks.stageTool(name, register) : register();
+              newlyRegistered.add(name);
+            }
             staged.set(name, handle);
             const disable = () => handle.disable();
             reloadHooks.disableTool ? reloadHooks.disableTool(name, disable) : disable();
@@ -1025,15 +1047,15 @@ function registerWorkspaceManagementTools(
           commit: () => {
             for (const [name, handle] of staged) {
               const enable = () => handle.enable();
-              reloadHooks.enableTool ? reloadHooks.enableTool(name, enable) : enable();
               enabledStaged.push([name, handle]);
+              reloadHooks.enableTool ? reloadHooks.enableTool(name, enable) : enable();
             }
             for (const name of removedNames) {
               const handle = businessHandles.get(name);
               if (!handle) continue;
               const disable = () => handle.disable();
-              reloadHooks.disableTool ? reloadHooks.disableTool(name, disable) : disable();
               disabledRemoved.push([name, handle]);
+              reloadHooks.disableTool ? reloadHooks.disableTool(name, disable) : disable();
             }
             for (const [name, handle] of staged) { businessHandles.set(name, handle); names.add(name); }
             for (const name of removedNames) names.delete(name);
@@ -1041,14 +1063,6 @@ function registerWorkspaceManagementTools(
           },
           rollback: rollbackPublication,
           afterCommit: () => {
-            for (const [name, handle] of disabledRemoved) {
-              try {
-                reloadHooks.removeTool ? reloadHooks.removeTool(name, () => handle.remove()) : handle.remove();
-                businessHandles.delete(name);
-              } catch (error) {
-                process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'business_tool_remove_failed', tool: name, message: error instanceof Error ? error.message : 'unknown' })}\n`);
-              }
-            }
             const published = generations.snapshot();
             try {
               const record = () => store.recordBusinessReload({

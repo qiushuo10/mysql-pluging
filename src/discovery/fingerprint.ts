@@ -4,6 +4,32 @@ import type { SqlParameters } from '../types.js';
 
 type ScanState = 'normal' | 'single' | 'double' | 'backtick' | 'line_comment' | 'block_comment';
 
+function numericLiteralEnd(sql: string, start: number): number | null {
+  const previous = sql[start - 1] ?? '';
+  if (/[A-Za-z0-9_$]/.test(previous)) return null;
+  let index = start;
+  if (sql[index] === '.' && !/\d/.test(sql[index + 1] ?? '')) return null;
+  if (sql[index] === '0' && /[xX]/.test(sql[index + 1] ?? '') && /[0-9A-Fa-f]/.test(sql[index + 2] ?? '')) {
+    index += 2;
+    while (/[0-9A-Fa-f]/.test(sql[index] ?? '')) index += 1;
+    return index;
+  }
+  while (/\d/.test(sql[index] ?? '')) index += 1;
+  if (sql[index] === '.') {
+    index += 1;
+    while (/\d/.test(sql[index] ?? '')) index += 1;
+  }
+  if (/[eE]/.test(sql[index] ?? '')) {
+    let exponent = index + 1;
+    if (sql[exponent] === '+' || sql[exponent] === '-') exponent += 1;
+    if (/\d/.test(sql[exponent] ?? '')) {
+      index = exponent + 1;
+      while (/\d/.test(sql[index] ?? '')) index += 1;
+    }
+  }
+  return index > start ? index : null;
+}
+
 /**
  * Produces a one-way shape identifier. The normalized SQL is deliberately not
  * returned or persisted: discovery only needs equality, never reconstruction.
@@ -41,9 +67,10 @@ export function sqlFingerprint(sql: string): string {
     if (char === "'") { state = 'single'; continue; }
     if (char === '"') { state = 'double'; continue; }
     if (char === '`') { state = 'backtick'; normalized += char; continue; }
-    if (/\d/.test(char) && !/[A-Za-z0-9_$]/.test(sql[index - 1] ?? '')) {
+    const numericEnd = (/\d/.test(char) || char === '.') ? numericLiteralEnd(sql, index) : null;
+    if (numericEnd !== null) {
       normalized += '?';
-      while (index + 1 < sql.length && /[0-9A-Fa-fxX.eE+-]/.test(sql[index + 1] ?? '')) index += 1;
+      index = numericEnd - 1;
       continue;
     }
     normalized += char;

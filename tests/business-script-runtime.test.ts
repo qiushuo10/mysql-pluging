@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { RunBusinessScriptRuntime } from '../src/business-scripts/runtime.js';
+import { validateBusinessScriptSyntax } from '../src/business-scripts/syntax.js';
 
 function request(source: string, overrides: Partial<Parameters<RunBusinessScriptRuntime['execute']>[0]> = {}) {
   return {
@@ -11,6 +12,16 @@ function request(source: string, overrides: Partial<Parameters<RunBusinessScript
 }
 
 describe('RunBusinessScriptRuntime', () => {
+  it('compiles the real async function body without executing it or allowing wrapper escape', async () => {
+    await expect(validateBusinessScriptSyntax('valid.script', `
+      const value: number = await Promise.resolve(7);
+      return value;
+    `)).resolves.toBeUndefined();
+    await expect(validateBusinessScriptSyntax('escape.script', `}
+      return 7;
+      if (false) {`)).rejects.toMatchObject({ code: 'BUSINESS_SCRIPT_SYNTAX_INVALID' });
+  });
+
   it('only exposes the two explicit host namespaces', async () => {
     const runtime = new RunBusinessScriptRuntime();
     const result = await runtime.execute(request(`

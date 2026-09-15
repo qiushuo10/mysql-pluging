@@ -118,6 +118,12 @@ function parseStringArray(value: unknown): string[] {
   }
 }
 
+function canonicalParameterShape(shape: DiscoveryRecord['parameterShape']): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(shape)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => [name, { type: value.type, list: value.list }])));
+}
+
 function usageGroup(row: Record<string, unknown>, groupBy?: UsageGroupBy): string {
   if (!groupBy) return 'all';
   if (groupBy === 'operation') return String(row.operation_id);
@@ -1149,7 +1155,7 @@ export class StateStore {
       .run(
         record.workspaceId, record.runId, record.traceId, record.datasourceId, record.environment,
         record.occurredAt, record.statementKind, record.sqlFingerprint,
-        JSON.stringify(record.parameterShape), JSON.stringify([...new Set(record.tableNames)].sort()),
+        canonicalParameterShape(record.parameterShape), JSON.stringify([...new Set(record.tableNames)].sort()),
         record.durationMs, record.resultBytes, record.status,
         previous?.sql_fingerprint ?? null, gap,
       );
@@ -1160,41 +1166,70 @@ export class StateStore {
     const values: Array<string | number> = [filters.workspaceId];
     if (filters.since) { clauses.push('occurred_at >= ?'); values.push(filters.since); }
     if (filters.until) { clauses.push('occurred_at <= ?'); values.push(filters.until); }
-    const rows = this.database.prepare(`SELECT * FROM discovery_events WHERE ${clauses.join(' AND ')}
-      ORDER BY occurred_at, id`).all(...values) as unknown as Array<Record<string, unknown>>;
-    const groups = new Map<string, Array<Record<string, unknown>>>();
-    for (const row of rows) {
-      const key = [row.datasource_id, row.environment, row.statement_kind, row.sql_fingerprint].join('\u0000');
-      const group = groups.get(key) ?? [];
-      group.push(row);
-      groups.set(key, group);
-    }
-    return [...groups.values()].filter((items) => items.length >= filters.minCount).map((items) => {
-      const sample = items[0]!;
-      const durations = items.map((row) => Number(row.duration_ms)).sort((a, b) => a - b);
-      const repeated = items.filter((row) => row.previous_fingerprint === sample.sql_fingerprint
-        && Number(row.previous_gap_ms ?? Number.MAX_SAFE_INTEGER) <= 300_000).length;
-      const repeatedSequenceScore = Math.round((repeated / Math.max(1, items.length - 1)) * 1000) / 1000;
-      const estimatedCallsSaved = Math.max(0, items.length - 1);
-      const errorCount = items.filter((row) => row.status === 'error').length;
-      const score = Math.round((Math.log2(items.length + 1) * 10 + repeatedSequenceScore * 20
-        + Math.min(20, percentile(durations, 0.95) / 500) - errorCount / items.length * 10) * 100) / 100;
-      const resultBytes = items.map((row) => Number(row.result_bytes ?? 0));
+    // The database performs windowing, grouping, repetition scoring and limiting. Only
+    // the bounded winning groups (plus two scalar percentile reads per group) reach JS.
+    const rows = this.database.prepare(`WITH windowed AS (
+        SELECT id, workspace_id, datasource_id, environment, occurred_at, statement_kind,
+          sql_fingerprint, parameter_shape_json, table_names_json, duration_ms, result_bytes, status,
+          previous_gap_ms,
+          LAG(sql_fingerprint) OVER (
+            PARTITION BY workspace_id, datasource_id, environment ORDER BY occurred_at, id
+          ) AS window_previous_fingerprint,
+          LAG(parameter_shape_json) OVER (
+            PARTITION BY workspace_id, datasource_id, environment ORDER BY occurred_at, id
+          ) AS window_previous_shape
+        FROM discovery_events WHERE ${clauses.join(' AND ')}
+      ), aggregated AS (
+        SELECT datasource_id, environment, statement_kind, sql_fingerprint, parameter_shape_json,
+          MIN(table_names_json) AS table_names_json, COUNT(*) AS event_count,
+          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+          AVG(duration_ms) AS avg_ms, AVG(result_bytes) AS avg_result_bytes,
+          SUM(CASE WHEN window_previous_fingerprint = sql_fingerprint
+            AND window_previous_shape = parameter_shape_json
+            AND previous_gap_ms <= 300000 THEN 1 ELSE 0 END) AS repeated_count
+        FROM windowed
+        GROUP BY datasource_id, environment, statement_kind, sql_fingerprint, parameter_shape_json
+        HAVING COUNT(*) >= ?
+      )
+      SELECT *, MIN(1.0, repeated_count * 1.0 / MAX(1, event_count - 1)) AS repeated_score,
+        (MIN(event_count, 100) * 0.55
+          + MIN(1.0, repeated_count * 1.0 / MAX(1, event_count - 1)) * 30
+          + (1.0 - error_count * 1.0 / event_count) * 15
+          + MIN(20.0, avg_ms / 500.0)) AS candidate_score
+      FROM aggregated
+      ORDER BY candidate_score DESC, event_count DESC, sql_fingerprint
+      LIMIT ?`).all(...values, filters.minCount, filters.limit) as unknown as Array<Record<string, unknown>>;
+    const percentileDuration = (sample: Record<string, unknown>, ratio: number): number => {
+      const count = Number(sample.event_count);
+      const offset = Math.max(0, Math.ceil(count * ratio) - 1);
+      const row = this.database.prepare(`SELECT duration_ms FROM discovery_events
+        WHERE ${clauses.join(' AND ')} AND datasource_id = ? AND environment = ?
+          AND statement_kind = ? AND sql_fingerprint = ? AND parameter_shape_json = ?
+        ORDER BY duration_ms, id LIMIT 1 OFFSET ?`).get(
+        ...values, sample.datasource_id as string, sample.environment as string,
+        sample.statement_kind as string, sample.sql_fingerprint as string,
+        sample.parameter_shape_json as string, offset,
+      ) as { duration_ms: number } | undefined;
+      return Number(row?.duration_ms ?? 0);
+    };
+    return rows.map((sample) => {
+      const count = Number(sample.event_count);
+      const errorCount = Number(sample.error_count);
+      const repeatedSequenceScore = Math.min(1, Math.max(0, Math.round(Number(sample.repeated_score) * 1000) / 1000));
       return {
         datasource_id: String(sample.datasource_id), environment: String(sample.environment),
         statement_kind: String(sample.statement_kind), sql_fingerprint: String(sample.sql_fingerprint),
-        count: items.length, error_count: errorCount,
-        p50_ms: percentile(durations, 0.5), p95_ms: percentile(durations, 0.95),
-        avg_ms: Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length * 100) / 100,
-        avg_result_bytes: Math.round(resultBytes.reduce((sum, value) => sum + value, 0) / resultBytes.length * 100) / 100,
+        count, error_count: errorCount,
+        p50_ms: percentileDuration(sample, 0.5), p95_ms: percentileDuration(sample, 0.95),
+        avg_ms: Math.round(Number(sample.avg_ms) * 100) / 100,
+        avg_result_bytes: Math.round(Number(sample.avg_result_bytes) * 100) / 100,
         repeated_sequence_score: repeatedSequenceScore,
-        estimated_mcp_calls_saved: estimatedCallsSaved, score,
+        estimated_mcp_calls_saved: Math.max(0, count - 1),
+        score: Math.round(Number(sample.candidate_score) * 100) / 100,
         table_names: parseStringArray(sample.table_names_json),
         parameter_shape: JSON.parse(String(sample.parameter_shape_json)) as unknown,
       };
-    }).sort((left, right) => Number(right.score) - Number(left.score)
-      || Number(right.count) - Number(left.count))
-      .slice(0, filters.limit);
+    });
   }
 
   cleanupDiscovery(workspaceId: string, before: string): number {

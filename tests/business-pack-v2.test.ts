@@ -221,17 +221,20 @@ operations:
     const app = createMysqlMcpApplication({
       stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
       workspaceReloadHooks: {
-        updateTool: (_name, update) => { if (failUpdate) throw new Error('injected update failure'); update(); },
+        updateTool: (_name, update) => { update(); if (failUpdate) throw new Error('injected update failure'); },
         stageTool: (_name, register) => { if (failStage) throw new Error('injected register failure'); return register(); },
       },
     });
     const client = await connect(app);
-    writeFileSync(join(state.packs, 'sample', 'sql', 'find.sql'), 'SELECT :id AS changed_id LIMIT 1');
+    const packPath = join(state.packs, 'sample', 'pack.yml');
+    writeFileSync(packPath, readFileSync(packPath, 'utf8').replace('title: 联合诊断', 'title: 新版联合诊断'));
     const initialGeneration = app.businessGenerationManager!.snapshot().id;
     const updateFailure = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(updateFailure.isError).toBe(true);
     expect(app.businessGenerationManager!.snapshot().id).toBe(initialGeneration);
     expect(closeSpy).toHaveBeenCalled();
+    expect((await client.listTools()).tools.find((tool) => tool.name === 'business__order__combine')?.title)
+      .toBe('联合诊断');
 
     failUpdate = false;
     failStage = true;
@@ -266,6 +269,39 @@ operations:
     closeSpy.mockRestore();
   });
 
+  it('restores the tool surface when enable, disable, or staged cleanup mutates before throwing', async () => {
+    const state = fixture();
+    let failEnable = true;
+    let failDisable = false;
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: {
+        enableTool: (_name, enable) => { enable(); if (failEnable) throw new Error('injected enable failure'); },
+        disableTool: (_name, disable) => { disable(); if (failDisable) throw new Error('injected disable failure'); },
+        removeTool: (_name, remove) => { remove(); throw new Error('injected remove-after-mutation failure'); },
+      },
+    });
+    const client = await connect(app);
+    const initialGeneration = app.businessGenerationManager!.snapshot().id;
+    const extra = writeReloadExtra(state.packs);
+    const enableFailure = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(enableFailure.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(initialGeneration);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+
+    failEnable = false;
+    expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('business__health__check');
+    const publishedGeneration = app.businessGenerationManager!.snapshot().id;
+    rmSync(extra, { recursive: true, force: true });
+    failDisable = true;
+    const disableFailure = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(disableFailure.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(publishedGeneration);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('business__health__check');
+    await client.close(); await app.close();
+  });
+
   it('commits reload when event persistence and list-changed notifications fail', async () => {
     const state = fixture();
     const app = createMysqlMcpApplication({
@@ -283,29 +319,20 @@ operations:
     await client.close(); await app.close();
   });
 
-  it('keeps removed tools disabled when handle removal fails and rejects unsafe re-add', async () => {
+  it('keeps removed tools disabled and safely reuses their handles on re-add', async () => {
     const state = fixture();
-    let failRemove = false;
-    const app = createMysqlMcpApplication({
-      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
-      workspaceReloadHooks: {
-        removeTool: (_name, remove) => { if (failRemove) throw new Error('injected remove failure'); remove(); },
-      },
-    });
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
     const client = await connect(app);
     const extra = writeReloadExtra(state.packs);
     expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
     rmSync(extra, { recursive: true, force: true });
-    failRemove = true;
     const removed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(removed.isError).toBe(false);
     expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
-    const stableGeneration = app.businessGenerationManager!.snapshot().id;
     writeReloadExtra(state.packs);
     const readd = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
-    expect(readd.isError).toBe(true);
-    expect(app.businessGenerationManager!.snapshot().id).toBe(stableGeneration);
-    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    expect(readd.isError).toBe(false);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('business__health__check');
     await client.close(); await app.close();
   });
 
@@ -334,6 +361,41 @@ operations:
     expect(app.businessGenerationManager!.snapshot().id).toBe(3);
     await client.close(); await app.close();
     validateSpy.mockRestore();
+  });
+
+  it('lets in-flight business SQL and script calls finish before application shutdown closes their generation', async () => {
+    for (const scenario of [
+      { tool: 'business__order__read', args: { operation: 'find', input: { id: 'A1' } }, calls: 1 },
+      { tool: 'business__order__combine', args: { id: 'A1' }, calls: 2 },
+    ]) {
+      const state = fixture();
+      const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+      const gates: Array<() => void> = [];
+      let allStarted!: () => void;
+      const started = new Promise<void>((resolve) => { allStarted = resolve; });
+      app.service.query = async (request) => {
+        await new Promise<void>((resolve) => {
+          gates.push(resolve);
+          if (gates.length === scenario.calls) allStarted();
+        });
+        return {
+          schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'query', connection: request.connection,
+          business_operation_id: request.businessOperationId ?? null, rows: [], row_count: 0, duration_ms: 1,
+        };
+      };
+      const client = await connect(app);
+      const call = client.callTool({ name: scenario.tool, arguments: scenario.args });
+      await started;
+      let shutdownFinished = false;
+      const shutdown = app.close().then(() => { shutdownFinished = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(shutdownFinished, scenario.tool).toBe(false);
+      for (const release of gates) release();
+      expect((await call).isError, scenario.tool).toBe(false);
+      await shutdown;
+      expect(shutdownFinished).toBe(true);
+      await client.close();
+    }
   });
 
   it('resolves SQL and scripts per environment, keeps public ids stable, and reports disabled targets', () => {

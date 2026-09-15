@@ -11,6 +11,8 @@ interface GenerationState {
   refs: number;
   retired: boolean;
   closing: Promise<void> | null;
+  closed: Promise<void>;
+  resolveClosed: () => void;
 }
 
 export interface RegistryGenerationSnapshot {
@@ -54,6 +56,8 @@ export class RegistryGenerationManager {
   private current: GenerationState;
   private readonly retired = new Set<GenerationState>();
   private reloadTail: Promise<void> = Promise.resolve();
+  private shutdownRequested = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(registry: BusinessOperationRegistry) {
     this.current = this.createState(1, registry);
@@ -64,6 +68,7 @@ export class RegistryGenerationManager {
   }
 
   acquire(): RegistryLease {
+    if (this.shutdownRequested) throw new Error('RegistryGenerationManager is closing');
     const state = this.current;
     state.refs += 1;
     let released = false;
@@ -79,18 +84,20 @@ export class RegistryGenerationManager {
     };
   }
 
-  async serializedReload<T>(prepare: () => Promise<PreparedRegistryTransaction<T>>): Promise<{
+  async serializedReload<T>(prepare: (current: { registry: BusinessOperationRegistry; generation: RegistryGenerationSnapshot }) => Promise<PreparedRegistryTransaction<T>>): Promise<{
     previous: RegistryGenerationSnapshot;
     current: RegistryGenerationSnapshot;
     value: T;
   }> {
+    if (this.shutdownRequested) throw new Error('RegistryGenerationManager is closing');
     let resolveTurn!: () => void;
     const turn = new Promise<void>((resolve) => { resolveTurn = resolve; });
     const prior = this.reloadTail;
     this.reloadTail = prior.then(() => turn, () => turn);
     await prior;
     try {
-      const prepared = await prepare();
+      if (this.shutdownRequested) throw new Error('RegistryGenerationManager is closing');
+      const prepared = await prepare({ registry: this.current.registry, generation: this.publicSnapshot(this.current) });
       const previous = this.current;
       const next = this.createState(previous.id + 1, prepared.registry);
       this.current = next;
@@ -131,18 +138,29 @@ export class RegistryGenerationManager {
   }
 
   async close(): Promise<void> {
-    await this.reloadTail;
-    const states = [this.current, ...this.retired];
-    await Promise.all(states.map(async (state) => {
-      state.retired = true;
-      if (!state.closing) state.closing = state.registry.close();
-      await state.closing;
-    }));
-    this.retired.clear();
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shutdownRequested = true;
+    this.shutdownPromise = (async () => {
+      await this.reloadTail;
+      const states = [this.current, ...this.retired];
+      for (const state of states) {
+        state.retired = true;
+        this.retired.add(state);
+        void this.closeIfUnused(state);
+      }
+      await Promise.all(states.map((state) => state.closed));
+      this.retired.clear();
+    })();
+    return this.shutdownPromise;
   }
 
   private createState(id: number, registry: BusinessOperationRegistry): GenerationState {
-    return { id, hash: businessGenerationHash(registry.all()), createdAt: new Date().toISOString(), registry, refs: 0, retired: false, closing: null };
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+    return {
+      id, hash: businessGenerationHash(registry.all()), createdAt: new Date().toISOString(),
+      registry, refs: 0, retired: false, closing: null, closed, resolveClosed,
+    };
   }
 
   private publicSnapshot(state: GenerationState): RegistryGenerationSnapshot {
@@ -152,6 +170,14 @@ export class RegistryGenerationManager {
   private async closeIfUnused(state: GenerationState): Promise<void> {
     if (!state.retired || state.refs !== 0 || state.closing) return;
     state.closing = state.registry.close();
-    try { await state.closing; } finally { this.retired.delete(state); }
+    try { await state.closing; } catch (error) {
+      process.stderr.write(`${JSON.stringify({
+        level: 'warn', event: 'registry_generation_close_failed', generation: state.id,
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`);
+    } finally {
+      state.resolveClosed();
+      this.retired.delete(state);
+    }
   }
 }
