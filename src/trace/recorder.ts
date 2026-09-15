@@ -11,6 +11,7 @@ import type {
 } from '../types.js';
 
 const MAX_MEASURED_RESULT_BYTES = 16 * 1_048_576;
+const TRACE_FINISH_ATTEMPTS = 3;
 let lastUuidTimestamp = -1;
 let lastUuidSequence = 0;
 
@@ -136,6 +137,18 @@ export class TraceRecorder {
     return context;
   }
 
+  tryStartRoot(input: TraceRootInput): ExecutionContext | null {
+    try {
+      return this.startRoot(input);
+    } catch (error) {
+      process.stderr.write(`${JSON.stringify({
+        level: 'warn', event: 'trace_start_failed', operation_kind: input.operationKind,
+        error_code: traceErrorCode(error),
+      })}\n`);
+      return null;
+    }
+  }
+
   startChild(parent: ExecutionContext, input: TraceChildInput): ExecutionContext {
     const startedAt = new Date().toISOString();
     const spanId = randomHex(8);
@@ -155,28 +168,24 @@ export class TraceRecorder {
     return context;
   }
 
-  finishSpan(context: ExecutionContext, input: TraceFinishInput): void {
-    try {
+  finishSpan(context: ExecutionContext, input: TraceFinishInput): boolean {
+    return this.finishWithRetry(context, 'span', () => {
       this.store.finishExecutionSpan(context.spanId, {
         endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
         queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
         resultBytes: resultBytes(input.result),
       });
-    } catch (error) {
-      this.logFinishFailure(context, error);
-    }
+    });
   }
 
-  finishRoot(context: ExecutionContext, input: TraceFinishInput): void {
-    try {
+  finishRoot(context: ExecutionContext, input: TraceFinishInput): boolean {
+    return this.finishWithRetry(context, 'root', () => {
       this.store.finishExecutionRoot(context.runId, context.rootSpanId, {
         endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
         queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
         resultBytes: resultBytes(input.result),
       });
-    } catch (error) {
-      this.logFinishFailure(context, error);
-    }
+    });
   }
 
   async withChild<T>(parent: ExecutionContext, input: TraceChildInput, handler: (context: ExecutionContext) => Promise<T>): Promise<T> {
@@ -199,10 +208,37 @@ export class TraceRecorder {
     }
   }
 
-  private logFinishFailure(context: ExecutionContext, error: unknown): void {
+  private finishWithRetry(context: ExecutionContext, target: 'root' | 'span', action: () => void): boolean {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= TRACE_FINISH_ATTEMPTS; attempt += 1) {
+      try {
+        action();
+        return true;
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableSqliteError(error) || attempt === TRACE_FINISH_ATTEMPTS) break;
+      }
+    }
     process.stderr.write(`${JSON.stringify({
-      level: 'warn', event: 'trace_finish_failed', run_id: context.runId, span_id: context.spanId,
-      message: error instanceof Error ? error.message : 'unknown',
+      level: 'warn', event: 'trace_finish_failed', target, run_id: context.runId, span_id: context.spanId,
+      error_code: traceErrorCode(lastError), attempts: isRetryableSqliteError(lastError) ? TRACE_FINISH_ATTEMPTS : 1,
     })}\n`);
+    return false;
   }
+}
+
+function traceErrorCode(error: unknown): string {
+  if (error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string') {
+    return String((error as { code: string }).code).slice(0, 64);
+  }
+  return error instanceof Error ? error.name.slice(0, 64) : 'UNKNOWN';
+}
+
+function isRetryableSqliteError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = String((error as { code?: unknown }).code ?? '').toUpperCase();
+  const message = error instanceof Error ? error.message.toUpperCase() : '';
+  return code.includes('SQLITE_BUSY') || code.includes('SQLITE_LOCKED')
+    || message.includes('SQLITE_BUSY') || message.includes('SQLITE_LOCKED')
+    || message.includes('DATABASE IS LOCKED');
 }

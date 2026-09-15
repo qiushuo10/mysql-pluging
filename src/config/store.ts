@@ -913,51 +913,90 @@ export class StateStore {
   }
 
   createExecutionRoot(run: ExecutionRunRecord, rootSpan: ExecutionSpanRecord): void {
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.createExecutionRun(run);
-      this.createExecutionSpan(rootSpan);
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
+    this.withTraceWriteTimeout(() => {
+      this.database.exec('BEGIN IMMEDIATE');
+      try {
+        this.createExecutionRun(run);
+        this.createExecutionSpan(rootSpan);
+        this.database.exec('COMMIT');
+      } catch (error) {
+        this.database.exec('ROLLBACK');
+        throw error;
+      }
+    });
   }
 
   finishExecutionRun(runId: string, finish: {
     endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
     errorCategory: string | null; resultBytes: number;
   }): void {
-    this.database.prepare(`
+    this.withTraceWriteTimeout(() => this.finishExecutionRunOnce(runId, finish));
+  }
+
+  private finishExecutionRunOnce(runId: string, finish: {
+    endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
+    errorCategory: string | null; resultBytes: number;
+  }): void {
+    const result = this.database.prepare(`
       UPDATE execution_runs SET ended_at = ?, duration_ms = ?,
         queue_duration_ms = COALESCE(?, queue_duration_ms), status = ?, error_category = ?, result_bytes = ?
       WHERE run_id = ? AND status = 'running'
     `).run(finish.endedAt, finish.durationMs, finish.queueDurationMs ?? null, finish.status, finish.errorCategory, finish.resultBytes, runId);
+    if (result.changes !== 1) {
+      throw new PluginError({
+        category: 'config_error', code: 'TRACE_RUN_FINISH_TARGET_MISSING',
+        message: `Trace run ${runId} 不存在或已经结束。`,
+      });
+    }
   }
 
   finishExecutionSpan(spanId: string, finish: {
     endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
     errorCategory: string | null; resultBytes: number;
   }): void {
-    this.database.prepare(`
+    this.withTraceWriteTimeout(() => this.finishExecutionSpanOnce(spanId, finish));
+  }
+
+  private finishExecutionSpanOnce(spanId: string, finish: {
+    endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
+    errorCategory: string | null; resultBytes: number;
+  }): void {
+    const result = this.database.prepare(`
       UPDATE execution_spans SET ended_at = ?, duration_ms = ?,
         queue_duration_ms = COALESCE(?, queue_duration_ms), status = ?, error_category = ?, result_bytes = ?
       WHERE span_id = ? AND status = 'running'
     `).run(finish.endedAt, finish.durationMs, finish.queueDurationMs ?? null, finish.status, finish.errorCategory, finish.resultBytes, spanId);
+    if (result.changes !== 1) {
+      throw new PluginError({
+        category: 'config_error', code: 'TRACE_SPAN_FINISH_TARGET_MISSING',
+        message: `Trace span ${spanId} 不存在或已经结束。`,
+      });
+    }
   }
 
   finishExecutionRoot(runId: string, rootSpanId: string, finish: {
     endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
     errorCategory: string | null; resultBytes: number;
   }): void {
-    this.database.exec('BEGIN IMMEDIATE');
+    this.withTraceWriteTimeout(() => {
+      this.database.exec('BEGIN IMMEDIATE');
+      try {
+        this.finishExecutionSpanOnce(rootSpanId, finish);
+        this.finishExecutionRunOnce(runId, finish);
+        this.database.exec('COMMIT');
+      } catch (error) {
+        this.database.exec('ROLLBACK');
+        throw error;
+      }
+    });
+  }
+
+  private withTraceWriteTimeout<T>(operation: () => T): T {
+    this.database.exec('PRAGMA busy_timeout=25');
     try {
-      this.finishExecutionSpan(rootSpanId, finish);
-      this.finishExecutionRun(runId, finish);
-      this.database.exec('COMMIT');
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
+      return operation();
+    } finally {
+      this.database.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}`);
     }
   }
 
@@ -1057,11 +1096,41 @@ export class StateStore {
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const spans = this.database.prepare(`SELECT COUNT(*) AS count FROM execution_spans
-        WHERE workspace_id = ? AND run_id IN (SELECT run_id FROM execution_runs WHERE workspace_id = ? AND started_at < ?)`)
+        WHERE workspace_id = ? AND run_id IN (
+          SELECT run_id FROM execution_runs
+          WHERE workspace_id = ? AND status <> 'running' AND ended_at IS NOT NULL AND ended_at < ?
+        )`)
         .get(workspaceId, workspaceId, before) as { count: number };
-      const deleted = this.database.prepare('DELETE FROM execution_runs WHERE workspace_id = ? AND started_at < ?').run(workspaceId, before);
+      const deleted = this.database.prepare(`DELETE FROM execution_runs
+        WHERE workspace_id = ? AND status <> 'running' AND ended_at IS NOT NULL AND ended_at < ?`).run(workspaceId, before);
       this.database.exec('COMMIT');
       return { runsDeleted: Number(deleted.changes), spansDeleted: Number(spans.count) };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  reconcileStaleExecutionRuns(workspaceId: string, startedBefore: string, endedAt = new Date().toISOString()): {
+    runsReconciled: number;
+    spansReconciled: number;
+  } {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const spans = this.database.prepare(`
+        UPDATE execution_spans SET ended_at = ?,
+          duration_ms = CAST(MAX(0, (julianday(?) - julianday(started_at)) * 86400000) AS INTEGER),
+          status = 'error', error_category = 'abandoned', result_bytes = 0
+        WHERE workspace_id = ? AND status = 'running' AND started_at < ?
+      `).run(endedAt, endedAt, workspaceId, startedBefore);
+      const runs = this.database.prepare(`
+        UPDATE execution_runs SET ended_at = ?,
+          duration_ms = CAST(MAX(0, (julianday(?) - julianday(started_at)) * 86400000) AS INTEGER),
+          status = 'error', error_category = 'abandoned', result_bytes = 0
+        WHERE workspace_id = ? AND status = 'running' AND started_at < ?
+      `).run(endedAt, endedAt, workspaceId, startedBefore);
+      this.database.exec('COMMIT');
+      return { runsReconciled: Number(runs.changes), spansReconciled: Number(spans.changes) };
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;

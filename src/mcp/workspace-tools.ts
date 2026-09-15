@@ -78,41 +78,56 @@ function result(kind: string, data: Record<string, unknown>): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(structuredContent) }], structuredContent, isError: false };
 }
 
-function failed(error: unknown, trace?: Pick<ExecutionContext, 'traceId' | 'runId'>): CallToolResult {
+function failed(
+  error: unknown,
+  trace?: Pick<ExecutionContext, 'traceId' | 'runId'>,
+  telemetryPersisted = trace !== undefined,
+): CallToolResult {
   const normalized = unknownError(error);
   const structuredContent = {
     schema_version: 'mysql-agent/result/1', execution_id: randomUUID(), status: 'error',
     category: normalized.category, code: normalized.code, message: normalized.message,
     retryable: normalized.retryable, write_outcome: normalized.writeOutcome,
     trace_id: trace?.traceId ?? null, run_id: trace?.runId ?? null,
+    telemetry_persisted: telemetryPersisted,
   };
   return { content: [{ type: 'text', text: `${normalized.code}: ${normalized.message}` }], structuredContent, isError: true };
 }
 
-function attachTrace(response: CallToolResult, trace: ExecutionContext): CallToolResult {
-  const structuredContent = { ...(response.structuredContent ?? {}), trace_id: trace.traceId, run_id: trace.runId };
+function attachTrace(response: CallToolResult, trace: ExecutionContext | null, telemetryPersisted: boolean): CallToolResult {
+  const structuredContent = {
+    ...(response.structuredContent ?? {}), trace_id: trace?.traceId ?? null, run_id: trace?.runId ?? null,
+    telemetry_persisted: telemetryPersisted,
+  };
   return { ...response, structuredContent, content: [{ type: 'text', text: JSON.stringify(structuredContent) }] };
 }
 
 async function tracedSafe(
   recorder: TraceRecorder,
   input: TraceRootInput,
-  handler: (context: ExecutionContext) => Promise<CallToolResult>,
+  handler: (context: ExecutionContext | undefined) => Promise<CallToolResult>,
 ): Promise<CallToolResult> {
-  const context = recorder.startRoot(input);
+  const context = recorder.tryStartRoot(input);
   try {
-    const response = attachTrace(await handler(context), context);
-    const queueDurationMs = Number((response.structuredContent as Record<string, unknown> | undefined)?.queue_duration_ms ?? 0);
-    recorder.finishRoot(context, { status: 'ok', result: response.structuredContent, queueDurationMs });
+    const rawResponse = await handler(context ?? undefined);
+    let response = attachTrace(rawResponse, context, context !== null);
+    if (context) {
+      const queueDurationMs = Number((response.structuredContent as Record<string, unknown> | undefined)?.queue_duration_ms ?? 0);
+      const persisted = recorder.finishRoot(context, { status: 'ok', result: response.structuredContent, queueDurationMs });
+      if (!persisted) response = attachTrace(rawResponse, context, false);
+    }
     return response;
   } catch (error) {
     const normalized = unknownError(error);
-    const response = failed(normalized, context);
-    recorder.finishRoot(context, {
-      status: normalized.code === 'REQUEST_CANCELLED' ? 'cancelled' : 'error',
-      errorCategory: normalized.category, result: response.structuredContent,
-      queueDurationMs: Number((error as { queueDurationMs?: unknown })?.queueDurationMs ?? 0),
-    });
+    let response = failed(normalized, context ?? undefined, context !== null);
+    if (context) {
+      const persisted = recorder.finishRoot(context, {
+        status: normalized.code === 'REQUEST_CANCELLED' ? 'cancelled' : 'error',
+        errorCategory: normalized.category, result: response.structuredContent,
+        queueDurationMs: Number((error as { queueDurationMs?: unknown })?.queueDurationMs ?? 0),
+      });
+      if (!persisted) response = failed(normalized, context, false);
+    }
     return response;
   }
 }
@@ -690,6 +705,8 @@ export function registerWorkspaceTools(input: {
 }): void {
   const names = new Set<string>();
   const recorder = input.recorder ?? new TraceRecorder(input.store);
+  const staleBefore = new Date(Date.now() - 60 * 60_000).toISOString();
+  input.store.reconcileStaleExecutionRuns(input.manager.context.workspaceId, staleBefore);
   const retentionBefore = new Date(Date.now() - input.manager.context.auditRetentionDays * 86_400_000).toISOString();
   input.store.cleanupExecutionTraces(input.manager.context.workspaceId, retentionBefore);
   const targets = workspaceTargets(input.manager, input.store);

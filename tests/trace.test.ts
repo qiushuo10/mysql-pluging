@@ -144,6 +144,29 @@ describe('trace identities and storage', () => {
     expect((database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name IN ('execution_runs','execution_spans')").get() as { count: number }).count).toBe(2);
     database.close();
   });
+
+  it('retries one SQLITE_BUSY finish and detects missing finish targets', () => {
+    const store = new StateStore(join(tempRoot('mysql-agent-trace-finish-'), 'home'));
+    const recorder = new TraceRecorder(store);
+    const context = recorder.startRoot({ workspaceId: 'one', operationId: 'query', operationKind: 'generic_sql' });
+    const originalFinish = store.finishExecutionRoot.bind(store);
+    let attempts = 0;
+    store.finishExecutionRoot = (...args) => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+      return originalFinish(...args);
+    };
+    expect(recorder.finishRoot(context, { status: 'ok', result: {} })).toBe(true);
+    expect(attempts).toBe(2);
+    expect(store.searchExecutionRuns({ workspaceId: 'one', runId: context.runId, limit: 1 }).records[0]?.status).toBe('ok');
+    expect(() => store.finishExecutionRun('missing-run', {
+      endedAt: new Date().toISOString(), durationMs: 1, status: 'error', errorCategory: 'internal_error', resultBytes: 0,
+    })).toThrow(/不存在或已经结束/);
+    expect(() => store.finishExecutionSpan('missing-span', {
+      endedAt: new Date().toISOString(), durationMs: 1, status: 'error', errorCategory: 'internal_error', resultBytes: 0,
+    })).toThrow(/不存在或已经结束/);
+    store.close();
+  });
 });
 
 describe('workspace trace tools', () => {
@@ -275,28 +298,76 @@ describe('workspace trace tools', () => {
     const client = await clientFor(application);
     const response = await client.callTool({ name: 'sql_query', arguments: { sql: 'SELECT 1 LIMIT 1' } });
     expect(response.isError).toBe(false);
-    expect(response.structuredContent).toEqual(expect.objectContaining({ status: 'ok', trace_id: expect.any(String), run_id: expect.any(String) }));
+    expect(response.structuredContent).toEqual(expect.objectContaining({
+      status: 'ok', trace_id: expect.any(String), run_id: expect.any(String), telemetry_persisted: false,
+    }));
+    await client.close();
+    await application.close();
+  });
+
+  it('continues the business handler and returns explicit telemetry state when root creation fails', async () => {
+    const fixture = workspaceFixture();
+    const application = createMysqlMcpApplication({ stateHome: fixture.home, mode: 'workspace', workspacePath: fixture.descriptor, operations: [] });
+    let handlerCalled = false;
+    let observedTrace: unknown = 'not-called';
+    application.store.createExecutionRoot = () => { throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' }); };
+    application.service.query = async (request) => {
+      handlerCalled = true;
+      observedTrace = request.traceContext;
+      return { status: 'ok', kind: 'query', rows: [], row_count: 0, connection: 'auto-test' };
+    };
+    const client = await clientFor(application);
+    const response = await client.callTool({ name: 'sql_query', arguments: { sql: 'SELECT 1 LIMIT 1' } });
+    expect(response.isError).toBe(false);
+    expect(handlerCalled).toBe(true);
+    expect(observedTrace).toBeUndefined();
+    expect(response.structuredContent).toEqual(expect.objectContaining({
+      status: 'ok', telemetry_persisted: false, trace_id: null, run_id: null,
+    }));
     await client.close();
     await application.close();
   });
 });
 
 describe('workspace trace retention', () => {
-  it('deletes only expired runs and cascaded spans for the selected workspace', () => {
+  it('retains running and recently-ended runs while deleting by ended_at in only one workspace', () => {
     const store = new StateStore(join(tempRoot('mysql-agent-trace-retention-'), 'home'));
     const recorder = new TraceRecorder(store);
     const oldOne = recorder.startRoot({ workspaceId: 'one', operationId: 'old-one', operationKind: 'sql' });
     recorder.finishRoot(oldOne, { status: 'ok', result: {} });
     const oldTwo = recorder.startRoot({ workspaceId: 'two', operationId: 'old-two', operationKind: 'sql' });
     recorder.finishRoot(oldTwo, { status: 'ok', result: {} });
+    const running = recorder.startRoot({ workspaceId: 'one', operationId: 'still-running', operationKind: 'sql' });
+    const endedRecently = recorder.startRoot({ workspaceId: 'one', operationId: 'ended-recently', operationKind: 'sql' });
+    recorder.finishRoot(endedRecently, { status: 'ok', result: {} });
     const database = new DatabaseSync(store.path);
-    database.prepare("UPDATE execution_runs SET started_at = '2026-01-01T00:00:00.000Z' WHERE run_id IN (?, ?)").run(oldOne.runId, oldTwo.runId);
+    database.prepare("UPDATE execution_runs SET started_at = '2026-01-01T00:00:00.000Z' WHERE run_id IN (?, ?, ?, ?)")
+      .run(oldOne.runId, oldTwo.runId, running.runId, endedRecently.runId);
+    database.prepare("UPDATE execution_runs SET ended_at = '2026-01-01T00:00:01.000Z' WHERE run_id IN (?, ?)").run(oldOne.runId, oldTwo.runId);
     database.close();
-    const fresh = recorder.startRoot({ workspaceId: 'one', operationId: 'fresh', operationKind: 'sql' });
-    recorder.finishRoot(fresh, { status: 'ok', result: {} });
     expect(store.cleanupExecutionTraces('one', '2026-02-01T00:00:00.000Z')).toEqual({ runsDeleted: 1, spansDeleted: 1 });
-    expect(store.searchExecutionRuns({ workspaceId: 'one', limit: 10 }).records.map((item) => item.operationId)).toEqual(['fresh']);
+    expect(new Set(store.searchExecutionRuns({ workspaceId: 'one', limit: 10 }).records.map((item) => item.operationId)))
+      .toEqual(new Set(['still-running', 'ended-recently']));
     expect(store.searchExecutionRuns({ workspaceId: 'two', limit: 10 }).records.map((item) => item.operationId)).toEqual(['old-two']);
+    store.close();
+  });
+
+  it('reconciles only sufficiently old running traces as abandoned', () => {
+    const store = new StateStore(join(tempRoot('mysql-agent-trace-reconcile-'), 'home'));
+    const recorder = new TraceRecorder(store);
+    const stale = recorder.startRoot({ workspaceId: 'one', operationId: 'stale', operationKind: 'sql' });
+    const active = recorder.startRoot({ workspaceId: 'one', operationId: 'active', operationKind: 'sql' });
+    const other = recorder.startRoot({ workspaceId: 'two', operationId: 'other', operationKind: 'sql' });
+    const database = new DatabaseSync(store.path);
+    database.prepare("UPDATE execution_runs SET started_at = '2026-01-01T00:00:00.000Z' WHERE run_id IN (?, ?)").run(stale.runId, other.runId);
+    database.prepare("UPDATE execution_spans SET started_at = '2026-01-01T00:00:00.000Z' WHERE run_id IN (?, ?)").run(stale.runId, other.runId);
+    database.close();
+    expect(store.reconcileStaleExecutionRuns('one', '2026-02-01T00:00:00.000Z', '2026-02-01T01:00:00.000Z'))
+      .toEqual({ runsReconciled: 1, spansReconciled: 1 });
+    expect(store.searchExecutionRuns({ workspaceId: 'one', runId: stale.runId, limit: 1 }).records[0])
+      .toEqual(expect.objectContaining({ status: 'error', errorCategory: 'abandoned', endedAt: '2026-02-01T01:00:00.000Z' }));
+    expect(store.searchExecutionRuns({ workspaceId: 'one', runId: active.runId, limit: 1 }).records[0]?.status).toBe('running');
+    expect(store.searchExecutionRuns({ workspaceId: 'two', runId: other.runId, limit: 1 }).records[0]?.status).toBe('running');
     store.close();
   });
 });
