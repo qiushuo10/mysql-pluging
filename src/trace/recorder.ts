@@ -156,19 +156,27 @@ export class TraceRecorder {
   }
 
   finishSpan(context: ExecutionContext, input: TraceFinishInput): void {
-    this.store.finishExecutionSpan(context.spanId, {
-      endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
-      queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
-      resultBytes: resultBytes(input.result),
-    });
+    try {
+      this.store.finishExecutionSpan(context.spanId, {
+        endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
+        queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
+        resultBytes: resultBytes(input.result),
+      });
+    } catch (error) {
+      this.logFinishFailure(context, error);
+    }
   }
 
   finishRoot(context: ExecutionContext, input: TraceFinishInput): void {
-    this.store.finishExecutionRoot(context.runId, context.rootSpanId, {
-      endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
-      queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
-      resultBytes: resultBytes(input.result),
-    });
+    try {
+      this.store.finishExecutionRoot(context.runId, context.rootSpanId, {
+        endedAt: new Date().toISOString(), durationMs: Math.max(0, Math.round(performance.now() - context.startedPerformanceMs)),
+        queueDurationMs: input.queueDurationMs, status: input.status, errorCategory: input.errorCategory ?? null,
+        resultBytes: resultBytes(input.result),
+      });
+    } catch (error) {
+      this.logFinishFailure(context, error);
+    }
   }
 
   async withChild<T>(parent: ExecutionContext, input: TraceChildInput, handler: (context: ExecutionContext) => Promise<T>): Promise<T> {
@@ -189,5 +197,12 @@ export class TraceRecorder {
       });
       throw error;
     }
+  }
+
+  private logFinishFailure(context: ExecutionContext, error: unknown): void {
+    process.stderr.write(`${JSON.stringify({
+      level: 'warn', event: 'trace_finish_failed', run_id: context.runId, span_id: context.spanId,
+      message: error instanceof Error ? error.message : 'unknown',
+    })}\n`);
   }
 }
