@@ -6,6 +6,7 @@ import { StateStore, type ConnectionIdentity } from '../config/store.js';
 import { PluginError, mapMysqlError, unknownError } from '../errors.js';
 import { compileNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
+import type { ExecutionContext } from '../trace/recorder.js';
 import type { BusinessMode, ConnectionConfig, SqlParameters, WriteOutcome } from '../types.js';
 import { boundedAffectedRows, executeQueryAttempt, executeWriteAttempt } from './executor.js';
 import { ConnectionRuntimeRegistry, DatabaseAttemptError } from './runtime.js';
@@ -28,6 +29,7 @@ export interface QueryRequest {
   datasourceId?: string;
   environment?: ConnectionConfig['environment'];
   expectedConnection?: ConnectionIdentity;
+  traceContext?: ExecutionContext;
 }
 
 export interface WriteRequest extends Omit<QueryRequest, 'maxRows' | 'retrySafeAfterSend'> {
@@ -136,6 +138,9 @@ export class MysqlService {
         truncated: run.value.truncated,
         duration_ms: durationMs,
         attempt_count: attemptCount,
+        queue_duration_ms: run.queueDurationMs ?? 0,
+        trace_id: request.traceContext?.traceId ?? null,
+        run_id: request.traceContext?.runId ?? null,
       });
       this.audit({
         executionId,
@@ -148,6 +153,7 @@ export class MysqlService {
         workspaceId: request.workspaceId,
         datasourceId: request.datasourceId,
         environment: request.environment,
+        traceContext: request.traceContext,
         statementKind: validation.kind,
         sqlHash,
         durationMs,
@@ -239,6 +245,9 @@ export class MysqlService {
         write_outcome: run.value.writeOutcome,
         duration_ms: durationMs,
         attempt_count: attemptCount,
+        queue_duration_ms: run.queueDurationMs ?? 0,
+        trace_id: request.traceContext?.traceId ?? null,
+        run_id: request.traceContext?.runId ?? null,
       };
       this.audit({
         executionId,
@@ -251,6 +260,7 @@ export class MysqlService {
         workspaceId: request.workspaceId,
         datasourceId: request.datasourceId,
         environment: request.environment,
+        traceContext: request.traceContext,
         statementKind: kind,
         sqlHash,
         durationMs,
@@ -353,6 +363,7 @@ export class MysqlService {
     workspaceId?: string;
     datasourceId?: string;
     environment?: ConnectionConfig['environment'];
+    traceContext?: ExecutionContext;
   }): void {
     try {
       this.store.recordAudit({
@@ -363,6 +374,9 @@ export class MysqlService {
         workspaceId: input.workspaceId ?? null,
         datasourceId: input.datasourceId ?? input.config.datasourceId ?? null,
         environment: input.environment ?? input.config.environment ?? null,
+        traceId: input.traceContext?.traceId ?? null,
+        spanId: input.traceContext?.spanId ?? null,
+        runId: input.traceContext?.runId ?? null,
         businessOperationId: input.businessOperationId ?? null,
         businessPackId: input.businessPackId ?? null,
         businessPackVersion: input.businessPackVersion ?? null,
@@ -406,6 +420,7 @@ export class MysqlService {
       workspaceId: request.workspaceId,
       datasourceId: request.datasourceId,
       environment: request.environment,
+      traceContext: request.traceContext,
       statementKind,
       sqlHash,
       durationMs,

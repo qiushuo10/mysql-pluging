@@ -10,6 +10,7 @@ import { BusinessOperationRegistry } from '../business-queries/registry.js';
 import type { AddConnectionInput, ConnectionIdentity, StateStore } from '../config/store.js';
 import { PluginError, unknownError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
+import { TraceRecorder, type ExecutionContext, type TraceRootInput } from '../trace/recorder.js';
 import type { ConnectionEnvironment, ConnectionSummary } from '../types.js';
 import type { WorkspaceContext, WorkspaceEnvironment } from '../workspace/context.js';
 import { WorkspaceManager } from '../workspace/context.js';
@@ -26,6 +27,8 @@ import {
   workspaceSqlExecuteSchema,
   workspaceSqlQuerySchema,
   workspaceValidateSchema,
+  workspaceTraceSearchSchema,
+  workspaceUsageSummarySchema,
 } from './schemas.js';
 
 interface WorkspaceTarget {
@@ -44,14 +47,43 @@ function result(kind: string, data: Record<string, unknown>): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(structuredContent) }], structuredContent, isError: false };
 }
 
-function failed(error: unknown): CallToolResult {
+function failed(error: unknown, trace?: Pick<ExecutionContext, 'traceId' | 'runId'>): CallToolResult {
   const normalized = unknownError(error);
   const structuredContent = {
     schema_version: 'mysql-agent/result/1', execution_id: randomUUID(), status: 'error',
     category: normalized.category, code: normalized.code, message: normalized.message,
     retryable: normalized.retryable, write_outcome: normalized.writeOutcome,
+    trace_id: trace?.traceId ?? null, run_id: trace?.runId ?? null,
   };
   return { content: [{ type: 'text', text: `${normalized.code}: ${normalized.message}` }], structuredContent, isError: true };
+}
+
+function attachTrace(response: CallToolResult, trace: ExecutionContext): CallToolResult {
+  const structuredContent = { ...(response.structuredContent ?? {}), trace_id: trace.traceId, run_id: trace.runId };
+  return { ...response, structuredContent, content: [{ type: 'text', text: JSON.stringify(structuredContent) }] };
+}
+
+async function tracedSafe(
+  recorder: TraceRecorder,
+  input: TraceRootInput,
+  handler: (context: ExecutionContext) => Promise<CallToolResult>,
+): Promise<CallToolResult> {
+  const context = recorder.startRoot(input);
+  try {
+    const response = attachTrace(await handler(context), context);
+    const queueDurationMs = Number((response.structuredContent as Record<string, unknown> | undefined)?.queue_duration_ms ?? 0);
+    recorder.finishRoot(context, { status: 'ok', result: response.structuredContent, queueDurationMs });
+    return response;
+  } catch (error) {
+    const normalized = unknownError(error);
+    const response = failed(normalized, context);
+    recorder.finishRoot(context, {
+      status: normalized.code === 'REQUEST_CANCELLED' ? 'cancelled' : 'error',
+      errorCategory: normalized.category, result: response.structuredContent,
+      queueDurationMs: Number((error as { queueDurationMs?: unknown })?.queueDurationMs ?? 0),
+    });
+    return response;
+  }
 }
 
 async function safe(handler: () => Promise<CallToolResult> | CallToolResult): Promise<CallToolResult> {
@@ -200,6 +232,7 @@ function registerBoundDataTools(
   service: MysqlService,
   initial: WorkspaceTarget,
   getClientName: () => string,
+  recorder: TraceRecorder,
 ): void {
   const suffix = initial.genericSuffix ? `__${initial.genericSuffix}` : '';
   const targetLabel = `${initial.datasourceId}/${initial.environment}`;
@@ -210,13 +243,16 @@ function registerBoundDataTools(
     description: `执行一条只读 SQL，目标由工作空间固定为 ${targetLabel}；输入不接受物理连接 alias。`,
     inputSchema: workspaceSqlQuerySchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, (args, extra) => safe(async () => {
+  }, (args, extra) => tracedSafe(recorder, {
+    workspaceId: manager.context.workspaceId, operationId: queryName, operationKind: 'generic_sql',
+    datasourceIds: [initial.datasourceId], environment: initial.environment, connectionAliases: [initial.alias],
+  }, async (traceContext) => {
     const target = liveTarget(manager, store, initial);
     const value = await service.query({
       connection: target.alias, sql: args.sql, parameters: args.parameters, maxRows: args.max_rows,
       timeoutMs: args.timeout_ms, requestSignal: extra.signal, clientName: getClientName(),
       workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
-      expectedConnection: target.identity,
+      expectedConnection: target.identity, traceContext,
     });
     return result('query', publicWorkspaceResult(value, target));
   }));
@@ -227,7 +263,10 @@ function registerBoundDataTools(
     title: `搜索 ${targetLabel} Schema`, description: `目标由工作空间固定为 ${targetLabel}。`,
     inputSchema: workspaceSchemaSearchSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, (args, extra) => safe(async () => {
+  }, (args, extra) => tracedSafe(recorder, {
+    workspaceId: manager.context.workspaceId, operationId: searchName, operationKind: 'schema',
+    datasourceIds: [initial.datasourceId], environment: initial.environment, connectionAliases: [initial.alias],
+  }, async () => {
     const target = liveTarget(manager, store, initial);
     const value = await service.schema.search({
       connection: target.alias, keyword: args.keyword, limit: args.limit, refresh: args.refresh,
@@ -242,7 +281,10 @@ function registerBoundDataTools(
     title: `描述 ${targetLabel} Schema`, description: `目标由工作空间固定为 ${targetLabel}。`,
     inputSchema: workspaceSchemaDescribeSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, (args, extra) => safe(async () => {
+  }, (args, extra) => tracedSafe(recorder, {
+    workspaceId: manager.context.workspaceId, operationId: describeName, operationKind: 'schema',
+    datasourceIds: [initial.datasourceId], environment: initial.environment, connectionAliases: [initial.alias],
+  }, async () => {
     const target = liveTarget(manager, store, initial);
     const value = await service.schema.describe({
       connection: target.alias, tables: args.tables, includeRelations: args.include_relations,
@@ -260,7 +302,10 @@ function registerBoundDataTools(
       title: `写入 ${targetLabel}`, description: `目标由工作空间固定为 ${targetLabel}。`,
       inputSchema: workspaceSqlExecuteSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    }, (args, extra) => safe(async () => {
+    }, (args, extra) => tracedSafe(recorder, {
+      workspaceId: manager.context.workspaceId, operationId: executeName, operationKind: 'generic_sql',
+      datasourceIds: [initial.datasourceId], environment: initial.environment, connectionAliases: [initial.alias],
+    }, async (traceContext) => {
       const target = liveTarget(manager, store, initial);
       if (target.policy.accessMode !== 'read_write' || store.requireConnection(target.alias).accessMode !== 'read_write') {
         throw new PluginError({ category: 'permission_error', code: 'WORKSPACE_TARGET_READ_ONLY', message: `${target.datasourceId}/${target.environment} 只允许读取。` });
@@ -270,6 +315,7 @@ function registerBoundDataTools(
         maxAffectedRows: args.max_affected_rows, requestSignal: extra.signal, clientName: getClientName(),
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
         expectedConnection: target.identity,
+        traceContext,
       });
       return result('execute', publicWorkspaceResult(value, target));
     }));
@@ -285,6 +331,7 @@ function registerWorkspaceBusinessTools(
   registry: BusinessOperationRegistry,
   targets: WorkspaceTarget[],
   getClientName: () => string,
+  recorder: TraceRecorder,
 ): void {
   const visible: Array<{ target: WorkspaceTarget; operation: BusinessOperation }> = [];
   for (const target of targets) {
@@ -300,7 +347,11 @@ function registerWorkspaceBusinessTools(
       description: `${item.operation.description} 目标由工作空间固定为 ${item.target.datasourceId}/${item.target.environment}。`,
       inputSchema: item.operation.input,
       annotations: annotations(item.operation),
-    }, (args, extra) => safe(async () => {
+    }, (args, extra) => tracedSafe(recorder, {
+      workspaceId: manager.context.workspaceId, operationId: publicOperationId(item.operation, item.target), operationKind: 'sql',
+      datasourceIds: [item.target.datasourceId], environment: item.target.environment, connectionAliases: [item.target.alias],
+      packId: item.operation.packId, packVersion: item.operation.packVersion, operationHash: item.operation.operationHash,
+    }, async (traceContext) => {
       const target = liveTarget(manager, store, item.target);
       if (target.alias !== item.operation.connection) {
         throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
@@ -308,6 +359,7 @@ function registerWorkspaceBusinessTools(
       const value = await registry.execute(item.operation, args, service, extra.signal, getClientName(), {
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
         expectedConnection: target.identity, publicOperationId: publicOperationId(item.operation, target),
+        traceContext,
       });
       return result('business_operation', publicWorkspaceResult(value, target));
     }));
@@ -337,20 +389,27 @@ function registerWorkspaceBusinessTools(
       title: `${qualifiedDomain} ${lane === 'read' ? '查询' : '写入'}操作`,
       description: '固定业务操作；数据源和环境由工作空间 binding 注入。', inputSchema,
       annotations: { readOnlyHint: lane === 'read', destructiveHint: lane === 'write', idempotentHint: lane === 'read', openWorldHint: true },
-    }, (args, extra) => safe(async () => {
-      const parsed = inputSchema.parse(args) as { operation: string; input: unknown };
-      const selected = group.find(({ operation }) => operation.name === parsed.operation);
-      if (!selected) throw configError('BUSINESS_OPERATION_NOT_FOUND', `工具 ${toolName} 不包含 ${parsed.operation}。`);
-      const target = liveTarget(manager, store, selected.target);
-      if (target.alias !== selected.operation.connection) {
-        throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
-      }
-      const value = await registry.execute(selected.operation, parsed.input, service, extra.signal, getClientName(), {
-        workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
-        expectedConnection: target.identity, publicOperationId: publicOperationId(selected.operation, target),
+    }, (args, extra) => {
+      const operationName = String((args as { operation?: unknown }).operation ?? '');
+      const selected = group.find(({ operation }) => operation.name === operationName);
+      if (!selected) return safe(() => { throw configError('BUSINESS_OPERATION_NOT_FOUND', `工具 ${toolName} 不包含 ${operationName}。`); });
+      return tracedSafe(recorder, {
+        workspaceId: manager.context.workspaceId, operationId: publicOperationId(selected.operation, selected.target), operationKind: 'sql',
+        datasourceIds: [selected.target.datasourceId], environment: selected.target.environment, connectionAliases: [selected.target.alias],
+        packId: selected.operation.packId, packVersion: selected.operation.packVersion, operationHash: selected.operation.operationHash,
+      }, async (traceContext) => {
+        const parsed = inputSchema.parse(args) as { operation: string; input: unknown };
+        const target = liveTarget(manager, store, selected.target);
+        if (target.alias !== selected.operation.connection) {
+          throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
+        }
+        const value = await registry.execute(selected.operation, parsed.input, service, extra.signal, getClientName(), {
+          workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
+          expectedConnection: target.identity, publicOperationId: publicOperationId(selected.operation, target), traceContext,
+        });
+        return result('business_operation', publicWorkspaceResult(value, target));
       });
-      return result('business_operation', publicWorkspaceResult(value, target));
-    }));
+    });
   }
 
   registerName(names, 'list_business_operations');
@@ -596,10 +655,14 @@ export function registerWorkspaceTools(input: {
   service: MysqlService;
   registry: BusinessOperationRegistry;
   getClientName: () => string;
+  recorder?: TraceRecorder;
 }): void {
   const names = new Set<string>();
+  const recorder = input.recorder ?? new TraceRecorder(input.store);
+  const retentionBefore = new Date(Date.now() - input.manager.context.auditRetentionDays * 86_400_000).toISOString();
+  input.store.cleanupExecutionTraces(input.manager.context.workspaceId, retentionBefore);
   const targets = workspaceTargets(input.manager, input.store);
-  for (const target of targets) registerBoundDataTools(input.server, names, input.manager, input.store, input.service, target, input.getClientName);
+  for (const target of targets) registerBoundDataTools(input.server, names, input.manager, input.store, input.service, target, input.getClientName, recorder);
 
   registerName(names, 'history_search');
   input.server.registerTool('history_search', {
@@ -619,10 +682,64 @@ export function registerWorkspaceTools(input: {
       business_operation_id: record.businessOperationId, statement_kind: record.statementKind,
       sql_hash: record.sqlHash, duration_ms: record.durationMs, row_count: record.rowCount,
       affected_rows: record.affectedRows, status: record.status, error_category: record.errorCategory,
+      trace_id: record.traceId, span_id: record.spanId, run_id: record.runId,
     }));
     return result('history_search', { record_count: records.length, records, next_before_id: history.nextBeforeId });
   }));
 
-  registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName);
+  registerName(names, 'trace_search');
+  input.server.registerTool('trace_search', {
+    title: '搜索当前工作空间 Trace', description: '只返回当前 workspace 的根调用和步骤摘要；不返回物理连接 alias。',
+    inputSchema: workspaceTraceSearchSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, (args) => safe(() => {
+    const found = input.store.searchExecutionRuns({
+      workspaceId: input.manager.context.workspaceId, traceId: args.trace_id, runId: args.run_id,
+      operationId: args.operation_id, operationKind: args.operation_kind, status: args.status,
+      datasourceId: args.datasource_id, environment: args.environment,
+      since: args.since ? new Date(args.since).toISOString() : undefined,
+      until: args.until ? new Date(args.until).toISOString() : undefined,
+      beforeStartedAt: args.before_started_at ? new Date(args.before_started_at).toISOString() : undefined,
+      limit: args.limit,
+    });
+    const records = found.records.map((run) => ({
+      run_id: run.runId, trace_id: run.traceId, root_span_id: run.rootSpanId,
+      task_id: run.taskId, operation_id: run.operationId, operation_kind: run.operationKind,
+      datasource_ids: run.datasourceIds, environment: run.environment, pack_id: run.packId,
+      pack_version: run.packVersion, operation_hash: run.operationHash, script_hash: run.scriptHash,
+      started_at: run.startedAt, ended_at: run.endedAt, duration_ms: run.durationMs,
+      queue_duration_ms: run.queueDurationMs, status: run.status, error_category: run.errorCategory,
+      result_bytes: run.resultBytes,
+      spans: input.store.listExecutionSpans(input.manager.context.workspaceId, run.runId).map((span) => ({
+        span_id: span.spanId, parent_span_id: span.parentSpanId, operation_id: span.operationId,
+        operation_kind: span.operationKind, datasource_id: span.datasourceId, environment: span.environment,
+        step_index: span.stepIndex, started_at: span.startedAt, ended_at: span.endedAt,
+        duration_ms: span.durationMs, queue_duration_ms: span.queueDurationMs, status: span.status,
+        error_category: span.errorCategory, result_bytes: span.resultBytes,
+      })),
+    }));
+    return result('trace_search', { record_count: records.length, records, next_before_started_at: found.nextBeforeStartedAt });
+  }));
+
+  registerName(names, 'usage_summary');
+  input.server.registerTool('usage_summary', {
+    title: '统计当前工作空间调用', description: '按当前 workspace 聚合已完成根调用的次数、错误、延迟分位数和结果字节数。',
+    inputSchema: workspaceUsageSummarySchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, (args) => safe(() => {
+    const groups = input.store.usageSummary({
+      workspaceId: input.manager.context.workspaceId, operationId: args.operation_id,
+      operationKind: args.operation_kind, status: args.status, datasourceId: args.datasource_id,
+      environment: args.environment, since: args.since ? new Date(args.since).toISOString() : undefined,
+      until: args.until ? new Date(args.until).toISOString() : undefined, groupBy: args.group_by,
+    }).map((group) => ({
+      group: group.group, count: group.count, error_count: group.errorCount,
+      p50_ms: group.p50Ms, p95_ms: group.p95Ms, p99_ms: group.p99Ms,
+      avg_ms: group.avgMs, result_bytes: group.resultBytes,
+    }));
+    return result('usage_summary', { group_by: args.group_by ?? null, groups });
+  }));
+
+  registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName, recorder);
   registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service);
 }

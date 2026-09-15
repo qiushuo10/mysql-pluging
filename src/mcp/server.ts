@@ -15,6 +15,7 @@ import { PluginError, unknownError } from '../errors.js';
 import { MysqlService } from '../mysql/service.js';
 import type { SchemaSnapshotLoader } from '../mysql/schema.js';
 import { WorkspaceManager, type RuntimeMode } from '../workspace/context.js';
+import { TraceRecorder } from '../trace/recorder.js';
 import { registerWorkspaceTools } from './workspace-tools.js';
 import {
   connectionAddSchema,
@@ -525,6 +526,7 @@ export interface MysqlMcpApplication {
   businessPacks: readonly LoadedBusinessPack[];
   mode: RuntimeMode;
   workspaceManager: WorkspaceManager | null;
+  traceRecorder: TraceRecorder;
   close(): Promise<void>;
 }
 
@@ -566,9 +568,10 @@ export function createMysqlMcpApplication(options: {
     }
   }
   const service = new MysqlService(store, undefined, options.schemaLoader);
+  const traceRecorder = new TraceRecorder(store);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
   if (workspaceManager) {
-    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server) });
+    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server), recorder: traceRecorder });
   } else {
     registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
     if (mode === 'global') registerBusinessTools(server, service, businessRegistry);
@@ -582,6 +585,7 @@ export function createMysqlMcpApplication(options: {
     businessPacks: loaded.packs,
     mode,
     workspaceManager,
+    traceRecorder,
     close: () => service.close(),
   };
 }

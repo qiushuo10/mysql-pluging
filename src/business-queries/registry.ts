@@ -7,6 +7,7 @@ import type { MysqlService } from '../mysql/service.js';
 import type { ConnectionIdentity } from '../config/store.js';
 import { compileNamedParameters, discoverNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
+import type { ExecutionContext } from '../trace/recorder.js';
 import type { SqlParameters, SqlScalar } from '../types.js';
 import type { ConnectionEnvironment } from '../types.js';
 import type { BusinessOperation } from './definition.js';
@@ -152,6 +153,7 @@ export class BusinessOperationRegistry {
       environment: ConnectionEnvironment;
       expectedConnection?: ConnectionIdentity;
       publicOperationId?: string;
+      traceContext?: ExecutionContext;
     },
   ): Promise<Record<string, unknown>> {
     const parameters = parseBusinessParameters(operation, input);
@@ -173,6 +175,7 @@ export class BusinessOperationRegistry {
         datasourceId: executionContext?.datasourceId,
         environment: executionContext?.environment,
         expectedConnection: executionContext?.expectedConnection,
+        traceContext: executionContext?.traceContext,
       });
     }
     return service.execute({
@@ -192,6 +195,7 @@ export class BusinessOperationRegistry {
       datasourceId: executionContext?.datasourceId,
       environment: executionContext?.environment,
       expectedConnection: executionContext?.expectedConnection,
+      traceContext: executionContext?.traceContext,
     });
   }
 }

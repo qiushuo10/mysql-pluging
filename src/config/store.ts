@@ -24,7 +24,13 @@ import type {
   ConnectionConfig,
   ConnectionEnvironment,
   ConnectionSummary,
+  ExecutionRunRecord,
+  ExecutionSpanRecord,
   SchemaSnapshotRecord,
+  TraceSearchFilters,
+  TraceStatus,
+  UsageGroupBy,
+  UsageSummaryFilters,
 } from '../types.js';
 
 export interface AddConnectionInput {
@@ -98,6 +104,30 @@ interface SchemaSnapshotRow {
 export function resolveStateHome(explicitHome?: string): string {
   const configured = explicitHome ?? process.env.MYSQL_AGENT_HOME;
   return resolve(configured || join(homedir(), '.mysql-agent'));
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function usageGroup(row: Record<string, unknown>, groupBy?: UsageGroupBy): string {
+  if (!groupBy) return 'all';
+  if (groupBy === 'operation') return String(row.operation_id);
+  if (groupBy === 'kind') return String(row.operation_kind);
+  if (groupBy === 'datasource') return parseStringArray(row.datasource_ids_json).sort().join(',') || '(none)';
+  if (groupBy === 'environment') return row.environment === null ? '(none)' : String(row.environment);
+  return String(row.status);
+}
+
+function percentile(sorted: number[], ratio: number): number {
+  if (sorted.length === 0) return 0;
+  return sorted[Math.max(0, Math.ceil(sorted.length * ratio) - 1)]!;
 }
 
 export class StateStore {
@@ -322,6 +352,97 @@ export class StateStore {
           );
         `);
         this.recordMigration(8);
+      }
+      if (current < 9) {
+        this.database.exec(`
+          CREATE TABLE IF NOT EXISTS execution_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            execution_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            client_name TEXT NOT NULL,
+            connection_alias TEXT NOT NULL,
+            workspace_id TEXT,
+            datasource_id TEXT,
+            environment TEXT,
+            trace_id TEXT,
+            span_id TEXT,
+            run_id TEXT,
+            business_operation_id TEXT,
+            business_pack_id TEXT,
+            business_pack_version TEXT,
+            business_operation_hash TEXT,
+            statement_kind TEXT NOT NULL,
+            sql_hash TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            row_count INTEGER,
+            affected_rows INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 1,
+            write_outcome TEXT,
+            status TEXT NOT NULL,
+            error_category TEXT,
+            mysql_error_code INTEGER
+          );
+        `);
+        const auditColumns = this.database.prepare('PRAGMA table_info(execution_audit)').all() as Array<{ name: string }>;
+        const auditNames = new Set(auditColumns.map((column) => column.name));
+        if (!auditNames.has('trace_id')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN trace_id TEXT');
+        if (!auditNames.has('span_id')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN span_id TEXT');
+        if (!auditNames.has('run_id')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN run_id TEXT');
+        this.database.exec(`
+          CREATE TABLE IF NOT EXISTS execution_runs (
+            run_id TEXT PRIMARY KEY,
+            workspace_id TEXT,
+            task_id TEXT,
+            trace_id TEXT NOT NULL,
+            root_span_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            operation_kind TEXT NOT NULL,
+            datasource_ids_json TEXT NOT NULL DEFAULT '[]',
+            environment TEXT,
+            connection_aliases_json TEXT NOT NULL DEFAULT '[]',
+            pack_id TEXT,
+            pack_version TEXT,
+            operation_hash TEXT,
+            script_hash TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            duration_ms INTEGER,
+            queue_duration_ms INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            error_category TEXT,
+            result_bytes INTEGER
+          );
+          CREATE TABLE IF NOT EXISTS execution_spans (
+            span_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES execution_runs(run_id) ON DELETE CASCADE,
+            trace_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            workspace_id TEXT,
+            operation_id TEXT NOT NULL,
+            operation_kind TEXT NOT NULL,
+            datasource_id TEXT,
+            environment TEXT,
+            connection_alias TEXT,
+            step_index INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            duration_ms INTEGER,
+            queue_duration_ms INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            error_category TEXT,
+            result_bytes INTEGER
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_runs_trace_root ON execution_runs(trace_id, root_span_id);
+          CREATE INDEX IF NOT EXISTS idx_execution_runs_workspace_started ON execution_runs(workspace_id, started_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_execution_runs_workspace_operation ON execution_runs(workspace_id, operation_id, started_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_execution_runs_workspace_target ON execution_runs(workspace_id, environment, started_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_execution_spans_run_step ON execution_spans(run_id, step_index, started_at);
+          CREATE INDEX IF NOT EXISTS idx_execution_spans_trace ON execution_spans(trace_id, started_at);
+          CREATE INDEX IF NOT EXISTS idx_execution_spans_workspace_target ON execution_spans(workspace_id, datasource_id, environment, started_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_execution_audit_trace ON execution_audit(trace_id, span_id);
+          CREATE INDEX IF NOT EXISTS idx_execution_audit_run ON execution_audit(run_id, occurred_at DESC);
+        `);
+        this.recordMigration(9);
       }
       this.database.exec('COMMIT');
     } catch (error) {
@@ -663,12 +784,12 @@ export class StateStore {
       .prepare(`
         INSERT INTO execution_audit (
           execution_id, occurred_at, client_name, connection_alias,
-          workspace_id, datasource_id, environment,
+          workspace_id, datasource_id, environment, trace_id, span_id, run_id,
           business_operation_id, business_pack_id, business_pack_version,
           business_operation_hash, statement_kind, sql_hash, duration_ms,
           row_count, affected_rows, attempt_count, write_outcome, status,
           error_category, mysql_error_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         record.executionId,
@@ -678,6 +799,9 @@ export class StateStore {
         record.workspaceId ?? null,
         record.datasourceId ?? null,
         record.environment ?? null,
+        record.traceId ?? null,
+        record.spanId ?? null,
+        record.runId ?? null,
         record.businessOperationId,
         record.businessPackId,
         record.businessPackVersion,
@@ -746,10 +870,215 @@ export class StateStore {
       status: String(row.status) as AuditRecord['status'],
       errorCategory: row.error_category === null ? null : String(row.error_category),
       mysqlErrorCode: row.mysql_error_code === null ? null : Number(row.mysql_error_code),
+      traceId: row.trace_id === null ? null : String(row.trace_id),
+      spanId: row.span_id === null ? null : String(row.span_id),
+      runId: row.run_id === null ? null : String(row.run_id),
     }));
     return {
       records,
       nextBeforeId: hasMore && records.length > 0 ? records[records.length - 1]!.id : null,
+    };
+  }
+
+  createExecutionRun(record: ExecutionRunRecord): void {
+    this.database.prepare(`
+      INSERT INTO execution_runs (
+        run_id, workspace_id, task_id, trace_id, root_span_id, operation_id, operation_kind,
+        datasource_ids_json, environment, connection_aliases_json, pack_id, pack_version,
+        operation_hash, script_hash, started_at, ended_at, duration_ms, queue_duration_ms,
+        status, error_category, result_bytes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.runId, record.workspaceId, record.taskId, record.traceId, record.rootSpanId,
+      record.operationId, record.operationKind, JSON.stringify(record.datasourceIds), record.environment,
+      JSON.stringify(record.connectionAliases), record.packId, record.packVersion, record.operationHash,
+      record.scriptHash, record.startedAt, record.endedAt, record.durationMs, record.queueDurationMs,
+      record.status, record.errorCategory, record.resultBytes,
+    );
+  }
+
+  createExecutionSpan(record: ExecutionSpanRecord): void {
+    this.database.prepare(`
+      INSERT INTO execution_spans (
+        span_id, run_id, trace_id, parent_span_id, workspace_id, operation_id, operation_kind,
+        datasource_id, environment, connection_alias, step_index, started_at, ended_at,
+        duration_ms, queue_duration_ms, status, error_category, result_bytes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.spanId, record.runId, record.traceId, record.parentSpanId, record.workspaceId,
+      record.operationId, record.operationKind, record.datasourceId, record.environment,
+      record.connectionAlias, record.stepIndex, record.startedAt, record.endedAt, record.durationMs,
+      record.queueDurationMs, record.status, record.errorCategory, record.resultBytes,
+    );
+  }
+
+  createExecutionRoot(run: ExecutionRunRecord, rootSpan: ExecutionSpanRecord): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.createExecutionRun(run);
+      this.createExecutionSpan(rootSpan);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  finishExecutionRun(runId: string, finish: {
+    endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
+    errorCategory: string | null; resultBytes: number;
+  }): void {
+    this.database.prepare(`
+      UPDATE execution_runs SET ended_at = ?, duration_ms = ?,
+        queue_duration_ms = COALESCE(?, queue_duration_ms), status = ?, error_category = ?, result_bytes = ?
+      WHERE run_id = ? AND status = 'running'
+    `).run(finish.endedAt, finish.durationMs, finish.queueDurationMs ?? null, finish.status, finish.errorCategory, finish.resultBytes, runId);
+  }
+
+  finishExecutionSpan(spanId: string, finish: {
+    endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
+    errorCategory: string | null; resultBytes: number;
+  }): void {
+    this.database.prepare(`
+      UPDATE execution_spans SET ended_at = ?, duration_ms = ?,
+        queue_duration_ms = COALESCE(?, queue_duration_ms), status = ?, error_category = ?, result_bytes = ?
+      WHERE span_id = ? AND status = 'running'
+    `).run(finish.endedAt, finish.durationMs, finish.queueDurationMs ?? null, finish.status, finish.errorCategory, finish.resultBytes, spanId);
+  }
+
+  finishExecutionRoot(runId: string, rootSpanId: string, finish: {
+    endedAt: string; durationMs: number; queueDurationMs?: number; status: Exclude<TraceStatus, 'running'>;
+    errorCategory: string | null; resultBytes: number;
+  }): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.finishExecutionSpan(rootSpanId, finish);
+      this.finishExecutionRun(runId, finish);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  searchExecutionRuns(filters: TraceSearchFilters): { records: ExecutionRunRecord[]; nextBeforeStartedAt: string | null } {
+    const clauses = ['workspace_id = ?'];
+    const values: Array<string | number> = [filters.workspaceId];
+    const add = (clause: string, value: string | number | undefined) => {
+      if (value === undefined) return;
+      clauses.push(clause);
+      values.push(value);
+    };
+    add('trace_id = ?', filters.traceId);
+    add('run_id = ?', filters.runId);
+    add('operation_id = ?', filters.operationId);
+    add('operation_kind = ?', filters.operationKind);
+    add('status = ?', filters.status);
+    if (filters.datasourceId !== undefined) {
+      clauses.push("EXISTS (SELECT 1 FROM json_each(execution_runs.datasource_ids_json) WHERE value = ?)");
+      values.push(filters.datasourceId);
+    }
+    add('environment = ?', filters.environment);
+    add('started_at >= ?', filters.since);
+    add('started_at <= ?', filters.until);
+    add('started_at < ?', filters.beforeStartedAt);
+    const rows = this.database.prepare(`
+      SELECT * FROM execution_runs WHERE ${clauses.join(' AND ')}
+      ORDER BY started_at DESC, run_id DESC LIMIT ?
+    `).all(...values, filters.limit + 1) as unknown as Array<Record<string, unknown>>;
+    const hasMore = rows.length > filters.limit;
+    const selected = hasMore ? rows.slice(0, filters.limit) : rows;
+    const records = selected.map((row) => this.executionRunFromRow(row));
+    return { records, nextBeforeStartedAt: hasMore && records.length > 0 ? records.at(-1)!.startedAt : null };
+  }
+
+  listExecutionSpans(workspaceId: string, runId: string): ExecutionSpanRecord[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM execution_spans WHERE workspace_id = ? AND run_id = ? ORDER BY step_index, started_at, span_id
+    `).all(workspaceId, runId) as unknown as Array<Record<string, unknown>>;
+    return rows.map((row) => this.executionSpanFromRow(row));
+  }
+
+  usageSummary(filters: UsageSummaryFilters): Array<{
+    group: string; count: number; errorCount: number; p50Ms: number; p95Ms: number; p99Ms: number;
+    avgMs: number; resultBytes: number;
+  }> {
+    const clauses = ["workspace_id = ?", "status <> 'running'", 'duration_ms IS NOT NULL'];
+    const values: Array<string | number> = [filters.workspaceId];
+    const add = (clause: string, value: string | number | undefined) => {
+      if (value === undefined) return;
+      clauses.push(clause); values.push(value);
+    };
+    add('operation_id = ?', filters.operationId);
+    add('operation_kind = ?', filters.operationKind);
+    add('status = ?', filters.status);
+    if (filters.datasourceId !== undefined) {
+      clauses.push("EXISTS (SELECT 1 FROM json_each(execution_runs.datasource_ids_json) WHERE value = ?)");
+      values.push(filters.datasourceId);
+    }
+    add('environment = ?', filters.environment);
+    add('started_at >= ?', filters.since);
+    add('started_at <= ?', filters.until);
+    const rows = this.database.prepare(`SELECT operation_id, operation_kind, datasource_ids_json, environment, status, duration_ms, result_bytes
+      FROM execution_runs WHERE ${clauses.join(' AND ')}`).all(...values) as unknown as Array<Record<string, unknown>>;
+    const groups = new Map<string, Array<Record<string, unknown>>>();
+    for (const row of rows) {
+      const key = usageGroup(row, filters.groupBy);
+      const group = groups.get(key) ?? [];
+      group.push(row); groups.set(key, group);
+    }
+    return [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([group, items]) => {
+      const durations = items.map((item) => Number(item.duration_ms)).sort((left, right) => left - right);
+      return {
+        group, count: items.length, errorCount: items.filter((item) => item.status !== 'ok').length,
+        p50Ms: percentile(durations, 0.50), p95Ms: percentile(durations, 0.95), p99Ms: percentile(durations, 0.99),
+        avgMs: durations.length === 0 ? 0 : Math.round((durations.reduce((sum, value) => sum + value, 0) / durations.length) * 100) / 100,
+        resultBytes: items.reduce((sum, item) => sum + Number(item.result_bytes ?? 0), 0),
+      };
+    });
+  }
+
+  /** Detailed export is intentionally deferred; callers must export and verify before invoking retention cleanup. */
+  cleanupExecutionTraces(workspaceId: string, before: string): { runsDeleted: number; spansDeleted: number } {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const spans = this.database.prepare(`SELECT COUNT(*) AS count FROM execution_spans
+        WHERE workspace_id = ? AND run_id IN (SELECT run_id FROM execution_runs WHERE workspace_id = ? AND started_at < ?)`)
+        .get(workspaceId, workspaceId, before) as { count: number };
+      const deleted = this.database.prepare('DELETE FROM execution_runs WHERE workspace_id = ? AND started_at < ?').run(workspaceId, before);
+      this.database.exec('COMMIT');
+      return { runsDeleted: Number(deleted.changes), spansDeleted: Number(spans.count) };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private executionRunFromRow(row: Record<string, unknown>): ExecutionRunRecord {
+    return {
+      runId: String(row.run_id), workspaceId: row.workspace_id === null ? null : String(row.workspace_id),
+      taskId: row.task_id === null ? null : String(row.task_id), traceId: String(row.trace_id), rootSpanId: String(row.root_span_id),
+      operationId: String(row.operation_id), operationKind: String(row.operation_kind) as ExecutionRunRecord['operationKind'],
+      datasourceIds: parseStringArray(row.datasource_ids_json), environment: row.environment === null ? null : String(row.environment) as ExecutionRunRecord['environment'],
+      connectionAliases: parseStringArray(row.connection_aliases_json), packId: row.pack_id === null ? null : String(row.pack_id),
+      packVersion: row.pack_version === null ? null : String(row.pack_version), operationHash: row.operation_hash === null ? null : String(row.operation_hash),
+      scriptHash: row.script_hash === null ? null : String(row.script_hash), startedAt: String(row.started_at), endedAt: row.ended_at === null ? null : String(row.ended_at),
+      durationMs: row.duration_ms === null ? null : Number(row.duration_ms), queueDurationMs: Number(row.queue_duration_ms),
+      status: String(row.status) as TraceStatus, errorCategory: row.error_category === null ? null : String(row.error_category),
+      resultBytes: row.result_bytes === null ? null : Number(row.result_bytes),
+    };
+  }
+
+  private executionSpanFromRow(row: Record<string, unknown>): ExecutionSpanRecord {
+    return {
+      spanId: String(row.span_id), runId: String(row.run_id), traceId: String(row.trace_id),
+      parentSpanId: row.parent_span_id === null ? null : String(row.parent_span_id), workspaceId: row.workspace_id === null ? null : String(row.workspace_id),
+      operationId: String(row.operation_id), operationKind: String(row.operation_kind) as ExecutionSpanRecord['operationKind'],
+      datasourceId: row.datasource_id === null ? null : String(row.datasource_id), environment: row.environment === null ? null : String(row.environment) as ExecutionSpanRecord['environment'],
+      connectionAlias: row.connection_alias === null ? null : String(row.connection_alias), stepIndex: Number(row.step_index),
+      startedAt: String(row.started_at), endedAt: row.ended_at === null ? null : String(row.ended_at), durationMs: row.duration_ms === null ? null : Number(row.duration_ms),
+      queueDurationMs: Number(row.queue_duration_ms), status: String(row.status) as TraceStatus,
+      errorCategory: row.error_category === null ? null : String(row.error_category), resultBytes: row.result_bytes === null ? null : Number(row.result_bytes),
     };
   }
 

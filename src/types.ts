@@ -3,6 +3,8 @@ export type ConnectionEnvironment = 'dev' | 'test' | 'staging' | 'prod' | 'custo
 export type StatementKind = 'select' | 'show' | 'describe' | 'explain' | 'insert' | 'update' | 'delete';
 export type BusinessMode = 'read' | 'insert' | 'update' | 'delete';
 export type WriteOutcome = 'not_applicable' | 'not_sent' | 'known_failed' | 'committed' | 'unknown';
+export type TraceOperationKind = 'sql' | 'script' | 'generic_sql' | 'schema';
+export type TraceStatus = 'running' | 'ok' | 'error' | 'cancelled';
 
 export interface ConnectionConfig {
   alias: string;
@@ -39,6 +41,9 @@ export interface AuditRecord {
   workspaceId?: string | null;
   datasourceId?: string | null;
   environment?: ConnectionEnvironment | null;
+  traceId?: string | null;
+  spanId?: string | null;
+  runId?: string | null;
   businessOperationId: string | null;
   businessPackId: string | null;
   businessPackVersion: string | null;
@@ -53,6 +58,80 @@ export interface AuditRecord {
   status: 'ok' | 'error';
   errorCategory: string | null;
   mysqlErrorCode: number | null;
+}
+
+export interface ExecutionRunRecord {
+  runId: string;
+  workspaceId: string | null;
+  taskId: string | null;
+  traceId: string;
+  rootSpanId: string;
+  operationId: string;
+  operationKind: TraceOperationKind;
+  datasourceIds: string[];
+  environment: ConnectionEnvironment | null;
+  connectionAliases: string[];
+  packId: string | null;
+  packVersion: string | null;
+  operationHash: string | null;
+  scriptHash: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  queueDurationMs: number;
+  status: TraceStatus;
+  errorCategory: string | null;
+  resultBytes: number | null;
+}
+
+export interface ExecutionSpanRecord {
+  spanId: string;
+  runId: string;
+  traceId: string;
+  parentSpanId: string | null;
+  workspaceId: string | null;
+  operationId: string;
+  operationKind: TraceOperationKind;
+  datasourceId: string | null;
+  environment: ConnectionEnvironment | null;
+  connectionAlias: string | null;
+  stepIndex: number;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  queueDurationMs: number;
+  status: TraceStatus;
+  errorCategory: string | null;
+  resultBytes: number | null;
+}
+
+export interface TraceSearchFilters {
+  workspaceId: string;
+  traceId?: string;
+  runId?: string;
+  operationId?: string;
+  operationKind?: TraceOperationKind;
+  status?: TraceStatus;
+  datasourceId?: string;
+  environment?: ConnectionEnvironment;
+  since?: string;
+  until?: string;
+  beforeStartedAt?: string;
+  limit: number;
+}
+
+export type UsageGroupBy = 'operation' | 'kind' | 'datasource' | 'environment' | 'status';
+
+export interface UsageSummaryFilters {
+  workspaceId: string;
+  operationId?: string;
+  operationKind?: TraceOperationKind;
+  status?: Exclude<TraceStatus, 'running'>;
+  datasourceId?: string;
+  environment?: ConnectionEnvironment;
+  since?: string;
+  until?: string;
+  groupBy?: UsageGroupBy;
 }
 
 export interface AuditHistoryRecord extends AuditRecord {

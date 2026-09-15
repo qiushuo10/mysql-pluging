@@ -51,6 +51,7 @@ export interface RuntimeRunOptions {
 export interface RuntimeRunResult<T> {
   value: T;
   attemptCount: number;
+  queueDurationMs?: number;
 }
 
 export class ConnectionRuntime {
@@ -103,6 +104,8 @@ export class ConnectionRuntime {
     let entered = false;
     let queueTimedOut = false;
     let attemptCount = 0;
+    const queuedAt = performance.now();
+    let queueDurationMs = 0;
     const queueController = new AbortController();
     const signals = [queueController.signal];
     if (options.requestSignal) signals.push(options.requestSignal);
@@ -130,6 +133,7 @@ export class ConnectionRuntime {
 
     const bulkheadPromise = this.bulkhead.execute(async () => {
       entered = true;
+      queueDurationMs = Math.max(0, Math.round(performance.now() - queuedAt));
       clearTimeout(queueTimer);
       const retryPolicy = retry(
         handleWhen(
@@ -157,7 +161,7 @@ export class ConnectionRuntime {
           ),
         activeSignal,
       )) as T;
-      return { value, attemptCount };
+      return { value, attemptCount, queueDurationMs };
     }, queueSignal);
 
     // Cockatiel removes an aborted queued item when a slot opens. Attach a handler
@@ -168,9 +172,9 @@ export class ConnectionRuntime {
       return await Promise.race([bulkheadPromise, queueTimeoutPromise]);
     } catch (error) {
       clearTimeout(queueTimer);
-      if (error instanceof PluginError) throw error;
+      if (error instanceof PluginError) throw Object.assign(error, { queueDurationMs: Math.max(0, Math.round(performance.now() - queuedAt)) });
       if (error instanceof BulkheadRejectedError || (error instanceof TaskCancelledError && queueTimedOut)) {
-        throw new PluginError({
+        throw Object.assign(new PluginError({
           category: 'connection_error',
           code: 'BUSY',
           message: `数据源 ${this.config.alias} 当前请求过多，请稍后重试。`,
@@ -178,7 +182,7 @@ export class ConnectionRuntime {
           retryAfterMs: 250,
           attemptCount,
           cause: error,
-        });
+        }), { queueDurationMs: Math.max(0, Math.round(performance.now() - queuedAt)) });
       }
       if (error instanceof BrokenCircuitError) {
         throw new PluginError({

@@ -1,7 +1,7 @@
 # MySQL Agent Plugin 协议与运行时设计
 
-状态：第一版已实现并通过本地验证
-更新日期：2026-08-26
+状态：基础能力与工作空间 Trace 已实现并通过本地验证
+更新日期：2026-09-15
 
 ## 1. 设计结论
 
@@ -315,6 +315,14 @@ Server 先在 SQLite 短事务中删除配置，再阻止新调用借用该别�
 Registry 启动时要求每个 SQL 占位符对应一个必填属性：普通占位符只能使用字符串、安全整数、布尔值或显式 `null`，展开占位符只能使用 1–100 项的一维标量数组；可选值、嵌套对象、对象数组、默认值、coercion、transform 和标量/列表错配会使启动失败。解析后的参数在编译 SQL 前还会再次按 `SqlParameters` 运行时边界校验。显式设置 `exposure: 'direct'` 时，生成 `business__<connection>__<domain>__<name>` 独立工具。
 
 业务 direct 与“数据源 + 业务域 + 读写通道”聚合入口生成最终工具名后，按 MCP 字符规则校验且最长 128 个字符；非法或过长名称在注册 Server 前作为配置错误拒绝。
+
+### 4.10 工作空间 Trace 与统计
+
+`workspace` 模式下，`sql_query*`、`sql_execute*`、`schema_search*`、`schema_describe*` 和固定 SQL 业务工具每次调用创建一条 `execution_runs` 根记录和一条 root span。成功和错误结果都返回 `trace_id` 与 UUIDv7 `run_id`。真实 SQL 的 `execution_audit` 继承当前 `run_id`、`trace_id` 和 `span_id`；后续脚本内部调用使用 `TraceRecorder.startChild()` 继承同一个 trace，不创建第二条 root。
+
+`trace_search` 只检索当前 descriptor 的 `workspace_id`，支持按 trace、run、operation、kind、status、逻辑数据源、环境和时间过滤。返回 root 与 child span 摘要，但不返回物理连接 alias。`usage_summary` 在同一隔离边界内统计 count、error_count、p50/p95/p99、平均耗时和结果字节数，可按 operation、kind、datasource、environment 或 status 分组。
+
+Trace 表只保存标识、逻辑目标、版本/hash、耗时、排队时间、状态和有界结果字节数，不保存参数值、SQL 全文、查询结果、密码或凭据。workspace 启动时按 `audit_retention_days` 清理该 workspace 的过期 run/span；SQLite 外键级联删除 span，不触碰其他 workspace。详细导出仍为后续能力，清理前的导出与 hash 校验由调用方负责。
 
 ```json
 {

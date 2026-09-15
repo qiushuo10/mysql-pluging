@@ -252,3 +252,38 @@ export const workspaceHistorySearchSchema = z.object({
 }).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
   message: 'since 不能晚于 until', path: ['since'],
 });
+
+const traceId = z.string().regex(/^[0-9a-f]{32}$/, 'trace_id 必须是 32 位小写十六进制');
+const runId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'run_id 必须是 UUIDv7');
+const completedTraceStatus = z.enum(['ok', 'error', 'cancelled']);
+const traceStatus = z.enum(['running', 'ok', 'error', 'cancelled']);
+const traceOperationKind = z.enum(['sql', 'script', 'generic_sql', 'schema']);
+
+export const workspaceTraceSearchSchema = z.object({
+  trace_id: traceId.optional(),
+  run_id: runId.optional(),
+  operation_id: z.string().min(1).max(192).optional(),
+  operation_kind: traceOperationKind.optional(),
+  status: traceStatus.optional(),
+  datasource_id: datasourceId.optional(),
+  environment: environment.optional(),
+  since: auditTimestamp.optional(),
+  until: auditTimestamp.optional(),
+  before_started_at: auditTimestamp.optional(),
+  limit: z.number().int().min(1).max(100).default(20),
+}).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
+  message: 'since 不能晚于 until', path: ['since'],
+});
+
+export const workspaceUsageSummarySchema = z.object({
+  operation_id: z.string().min(1).max(192).optional(),
+  operation_kind: traceOperationKind.optional(),
+  status: completedTraceStatus.optional(),
+  datasource_id: datasourceId.optional(),
+  environment: environment.optional(),
+  since: auditTimestamp.optional(),
+  until: auditTimestamp.optional(),
+  group_by: z.enum(['operation', 'kind', 'datasource', 'environment', 'status']).optional(),
+}).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
+  message: 'since 不能晚于 until', path: ['since'],
+});
