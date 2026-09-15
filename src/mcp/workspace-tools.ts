@@ -321,6 +321,35 @@ export interface WorkspaceReloadHooks {
   sendListChanged?: (send: () => void) => void;
 }
 
+export const MAX_BUSINESS_TOOL_TOMBSTONES = 32;
+
+class BusinessToolTombstones {
+  private readonly handles = new Map<string, RegisteredTool>();
+
+  has(name: string): boolean { return this.handles.has(name); }
+
+  add(name: string, handle: RegisteredTool): void {
+    try { handle.disable(); } catch { /* failed removal must still leave the tool hidden */ }
+    this.handles.set(name, handle);
+    while (this.handles.size > MAX_BUSINESS_TOOL_TOMBSTONES) {
+      const oldest = this.handles.entries().next().value as [string, RegisteredTool] | undefined;
+      if (!oldest) break;
+      try { oldest[1].remove(); } catch { /* local references remain strictly bounded */ }
+      this.handles.delete(oldest[0]);
+    }
+  }
+
+  /** Retry SDK-local removal without a previously failing publication hook. */
+  reap(): void {
+    for (const [name, handle] of this.handles) {
+      try {
+        handle.remove();
+        this.handles.delete(name);
+      } catch { /* retained for a later bounded retry */ }
+    }
+  }
+}
+
 function workspaceBusinessDescriptors(
   registry: BusinessOperationRegistry,
   store: StateStore,
@@ -753,6 +782,7 @@ function registerWorkspaceManagementTools(
   reloadHooks: WorkspaceReloadHooks,
 ): void {
   const addTool = (name: string) => registerName(names, name);
+  const tombstones = new BusinessToolTombstones();
   addTool('workspace_datasource_add');
   server.registerTool('workspace_datasource_add', {
     title: '新增工作空间数据源', description: '创建当前工作空间自有的 dev/test/staging 连接并原子写入 binding；不回显密码。',
@@ -937,6 +967,7 @@ function registerWorkspaceManagementTools(
     const candidateHolder: { value?: BusinessOperationRegistry } = {};
     try {
       const swapped = await generations.serializedReload(async (current) => {
+        tombstones.reap();
         let oldSchemaSurface: Map<string, string>;
         let oldCatalogSurface: Map<string, string>;
         const targets = workspaceTargets(manager, store);
@@ -993,6 +1024,9 @@ function registerWorkspaceManagementTools(
             reloadHooks.updateTool ? reloadHooks.updateTool(name, update) : update();
           }
           for (const name of addedNames) {
+            if (tombstones.has(name)) {
+              throw configError('BUSINESS_TOOL_TOMBSTONE_BUSY', `工具 ${name} 的旧句柄尚未完成回收，请稍后重试。`);
+            }
             const stale = businessHandles.get(name);
             const descriptor = nextDescriptors.get(name)!;
             let handle: RegisteredTool;
@@ -1063,6 +1097,20 @@ function registerWorkspaceManagementTools(
           },
           rollback: rollbackPublication,
           afterCommit: () => {
+            for (const [name, handle] of disabledRemoved) {
+              try {
+                const remove = () => handle.remove();
+                reloadHooks.removeTool ? reloadHooks.removeTool(name, remove) : remove();
+              } catch (error) {
+                tombstones.add(name, handle);
+                process.stderr.write(`${JSON.stringify({
+                  level: 'warn', event: 'business_tool_remove_failed', tool: name,
+                  message: error instanceof Error ? error.message : 'unknown',
+                })}\n`);
+              } finally {
+                businessHandles.delete(name);
+              }
+            }
             const published = generations.snapshot();
             try {
               const record = () => store.recordBusinessReload({

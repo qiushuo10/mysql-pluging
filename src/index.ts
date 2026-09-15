@@ -2,7 +2,6 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { SHUTDOWN_TIMEOUT_MS } from './constants.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from './mcp/server.js';
 import { parseRuntimeOptions } from './workspace/context.js';
 
@@ -10,13 +9,12 @@ let application: MysqlMcpApplication | undefined;
 let closing = false;
 
 async function shutdown(exitCode = 0): Promise<void> {
-  if (closing) return;
+  if (closing) {
+    if (application) await application.forceClose();
+    return;
+  }
   closing = true;
-  const deadline = new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, SHUTDOWN_TIMEOUT_MS);
-    timer.unref();
-  });
-  if (application) await Promise.race([application.close(), deadline]);
+  if (application) await application.close();
   process.exitCode = exitCode;
 }
 
@@ -28,7 +26,7 @@ try {
   application = createMysqlMcpApplication({ mode: runtime.mode, workspacePath: runtime.workspacePath });
   const transport = new StdioServerTransport();
   application.server.server.onclose = () => {
-    void shutdown();
+    if (!closing) void shutdown();
   };
   await application.server.connect(transport);
 } catch (error) {

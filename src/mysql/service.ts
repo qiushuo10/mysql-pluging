@@ -84,6 +84,8 @@ export class MysqlService {
   readonly store: StateStore;
   readonly runtimes: ConnectionRuntimeRegistry;
   readonly schema: SchemaService;
+  private closePromise: Promise<void> | null = null;
+  private forceClosed = false;
 
   constructor(store: StateStore, runtimes = new ConnectionRuntimeRegistry(), schemaLoader?: SchemaSnapshotLoader) {
     this.store = store;
@@ -283,7 +285,12 @@ export class MysqlService {
       return result;
     } catch (error) {
       if (config && isSchemaDriftError(error)) this.schema.invalidate(config.alias, config.revision);
-      const pluginError = this.mapExecutionError(error, request.connection, true, attemptCount, writeSent, compiled.values);
+      const pluginError = request.requestSignal?.aborted && writeSent
+        ? normalizeWritePluginError(new PluginError({
+          category: 'timeout', code: 'REQUEST_CANCELLED', message: '写入在关闭期间被取消。',
+          retryable: false, attemptCount, cause: error,
+        }), request.connection, true)
+        : this.mapExecutionError(error, request.connection, true, attemptCount, writeSent, compiled.values);
       const durationMs = Math.round(performance.now() - started);
       this.auditError(executionId, request, config, kind, sqlHash, durationMs, pluginError);
       if (discoveryTables) this.recordDiscoveryBestEffort(request, kind, discoveryTables, durationMs, 0, 'error');
@@ -292,8 +299,23 @@ export class MysqlService {
   }
 
   async close(): Promise<void> {
-    await this.runtimes.closeAll();
-    this.store.close();
+    if (this.forceClosed) return;
+    this.closePromise ??= (async () => {
+      await this.runtimes.closeAll();
+      this.store.close();
+    })();
+    await this.closePromise;
+  }
+
+  forceClose(): void {
+    if (this.forceClosed) return;
+    this.forceClosed = true;
+    try { this.runtimes.forceClose(); } catch (error) {
+      process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'mysql_runtimes_force_close_failed', message: error instanceof Error ? error.message : 'unknown' })}\n`);
+    }
+    try { this.store.close(); } catch (error) {
+      process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'state_store_force_close_failed', message: error instanceof Error ? error.message : 'unknown' })}\n`);
+    }
   }
 
   private requireEnabledConnection(alias: string, expected?: ConnectionIdentity): ConnectionConfig {

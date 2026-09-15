@@ -25,6 +25,18 @@ describe('write outcome mapping', () => {
     expect(error.retryable).toBe(false);
   });
 
+  it('keeps a shutdown cancellation after send explicitly unknown', () => {
+    const error = normalizeWritePluginError(
+      new PluginError({ category: 'timeout', code: 'REQUEST_CANCELLED', message: 'shutdown', retryable: false }),
+      'auto-fat',
+      true,
+    );
+    expect(error).toMatchObject({
+      category: 'write_outcome_unknown', code: 'MYSQL_WRITE_OUTCOME_UNKNOWN',
+      writeOutcome: 'unknown', retryable: false,
+    });
+  });
+
   it('keeps explicit MySQL failures known', () => {
     const mysqlError = Object.assign(new Error('duplicate'), {
       errno: 1062,

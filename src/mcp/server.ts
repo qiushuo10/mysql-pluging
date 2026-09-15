@@ -13,6 +13,7 @@ import {
   type LoadedBusinessPack,
 } from '../business-packs/loader.js';
 import { StateStore } from '../config/store.js';
+import { SHUTDOWN_TIMEOUT_MS } from '../constants.js';
 import { PluginError, unknownError } from '../errors.js';
 import { MysqlService } from '../mysql/service.js';
 import type { SchemaSnapshotLoader } from '../mysql/schema.js';
@@ -20,6 +21,7 @@ import { WorkspaceManager, type RuntimeMode } from '../workspace/context.js';
 import { TraceRecorder } from '../trace/recorder.js';
 import { registerWorkspaceTools } from './workspace-tools.js';
 import type { WorkspaceReloadHooks } from './workspace-tools.js';
+import { ToolShutdownGate } from './shutdown.js';
 import {
   connectionAddSchema,
   connectionListSchema,
@@ -532,7 +534,9 @@ export interface MysqlMcpApplication {
   workspaceManager: WorkspaceManager | null;
   traceRecorder: TraceRecorder;
   businessGenerationManager: RegistryGenerationManager | null;
+  shutdownGate: ToolShutdownGate;
   close(): Promise<void>;
+  forceClose(): Promise<void>;
 }
 
 export function createMysqlMcpApplication(options: {
@@ -543,6 +547,8 @@ export function createMysqlMcpApplication(options: {
   mode?: RuntimeMode;
   workspacePath?: string;
   workspaceReloadHooks?: WorkspaceReloadHooks;
+  /** Test/embedding override, always capped by SHUTDOWN_TIMEOUT_MS. */
+  shutdownTimeoutMs?: number;
 } = {}): MysqlMcpApplication {
   const mode = options.mode ?? 'global';
   if (mode === 'workspace' && !options.workspacePath) {
@@ -578,12 +584,66 @@ export function createMysqlMcpApplication(options: {
   const service = new MysqlService(store, undefined, options.schemaLoader);
   const traceRecorder = new TraceRecorder(store);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
+  const shutdownGate = new ToolShutdownGate();
+  shutdownGate.install(server);
   if (workspaceManager) {
     registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, generationManager: businessGenerationManager!, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations, reloadHooks: options.workspaceReloadHooks });
   } else {
     registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
     if (mode === 'global') registerBusinessTools(server, service, businessRegistry);
   }
+  const shutdownTimeoutMs = Math.min(SHUTDOWN_TIMEOUT_MS, Math.max(1, options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS));
+  let closePromise: Promise<void> | null = null;
+  let forceClosePromise: Promise<void> | null = null;
+  const logCloseFailure = (event: string, error: unknown) => {
+    process.stderr.write(`${JSON.stringify({
+      level: 'warn', event, message: error instanceof Error ? error.message : 'unknown',
+    })}\n`);
+  };
+  const within = async (promise: Promise<unknown>, timeoutMs: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); });
+    const completed = promise.then(() => true, (error: unknown) => {
+      logCloseFailure('mcp_graceful_close_failed', error);
+      return false;
+    });
+    const result = await Promise.race([completed, timedOut]);
+    if (timer) clearTimeout(timer);
+    return result;
+  };
+  const forceClose = (): Promise<void> => {
+    if (forceClosePromise) return forceClosePromise;
+    shutdownGate.abortInFlight();
+    businessGenerationManager?.forceClose();
+    if (!businessGenerationManager) void businessRegistry.close().catch((error: unknown) => logCloseFailure('business_registry_force_close_failed', error));
+    service.forceClose();
+    forceClosePromise = (async () => {
+      const transportClose = server.close().catch((error: unknown) => logCloseFailure('mcp_transport_force_close_failed', error));
+      await within(transportClose, Math.min(250, shutdownTimeoutMs));
+    })();
+    return forceClosePromise;
+  };
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    shutdownGate.stopAccepting();
+    closePromise = (async () => {
+      const startedAt = performance.now();
+      const drained = await shutdownGate.waitForIdle(shutdownTimeoutMs);
+      if (!drained) { await forceClose(); return; }
+      // The gate observes handler completion. Give the MCP protocol loop one turn to
+      // serialize and send the final response before closing its transport.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const remaining = Math.max(0, shutdownTimeoutMs - Math.round(performance.now() - startedAt));
+      const graceful = (async () => {
+        if (businessGenerationManager) await businessGenerationManager.close();
+        else await businessRegistry.close();
+        await service.close();
+        await server.close();
+      })();
+      if (!await within(graceful, remaining)) await forceClose();
+    })();
+    return closePromise;
+  };
   return {
     server,
     store,
@@ -596,6 +656,8 @@ export function createMysqlMcpApplication(options: {
     workspaceManager,
     traceRecorder,
     businessGenerationManager,
-    close: async () => { if (businessGenerationManager) await businessGenerationManager.close(); else await businessRegistry.close(); await service.close(); },
+    shutdownGate,
+    close,
+    forceClose,
   };
 }

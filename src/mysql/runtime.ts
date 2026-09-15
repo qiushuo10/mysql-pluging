@@ -14,7 +14,7 @@ import {
   type BulkheadPolicy,
   type CircuitBreakerPolicy,
 } from 'cockatiel';
-import mysql, { type Pool } from 'mysql2/promise';
+import mysql, { type Pool, type PoolConnection } from 'mysql2/promise';
 
 import {
   BULKHEAD_QUEUE_MULTIPLIER,
@@ -59,6 +59,9 @@ export class ConnectionRuntime {
   readonly pool: Pool;
   readonly bulkhead: BulkheadPolicy;
   readonly circuit: CircuitBreakerPolicy;
+  private readonly connections = new Set<PoolConnection>();
+  private closePromise: Promise<void> | null = null;
+  private forceClosed = false;
 
   constructor(config: ConnectionConfig) {
     this.config = config;
@@ -84,6 +87,7 @@ export class ConnectionRuntime {
       decimalNumbers: false,
       maxPreparedStatements: 256,
     });
+    this.pool.on('connection', (connection) => { this.connections.add(connection); });
     this.bulkhead = bulkhead(config.poolMax, config.poolMax * BULKHEAD_QUEUE_MULTIPLIER);
     this.circuit = circuitBreaker(
       handleWhen((error) => error instanceof DatabaseAttemptError && error.transient),
@@ -216,7 +220,24 @@ export class ConnectionRuntime {
   }
 
   async close(): Promise<void> {
-    await this.pool.end();
+    if (this.forceClosed) return;
+    this.closePromise ??= this.pool.end();
+    await this.closePromise;
+  }
+
+  forceClose(): void {
+    if (this.forceClosed) return;
+    this.forceClosed = true;
+    for (const connection of this.connections) {
+      try { connection.destroy(); } catch { /* best effort during forced shutdown */ }
+    }
+    this.connections.clear();
+    void this.pool.end().catch((error: unknown) => {
+      process.stderr.write(`${JSON.stringify({
+        level: 'warn', event: 'mysql_runtime_force_close_failed', connection: this.config.alias,
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`);
+    });
   }
 
   private logCircuit(state: string): void {
@@ -228,6 +249,15 @@ export class ConnectionRuntime {
 
 export class ConnectionRuntimeRegistry {
   private readonly entries = new Map<string, RuntimeEntry>();
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
+
+  private assertOpen(): void {
+    if (this.closing) throw new PluginError({
+      category: 'internal_error', code: 'SERVER_SHUTTING_DOWN',
+      message: 'MySQL runtime 正在关闭。', retryable: true, retryAfterMs: 1_000,
+    });
+  }
 
   private entry(alias: string): RuntimeEntry {
     let entry = this.entries.get(alias);
@@ -242,8 +272,10 @@ export class ConnectionRuntimeRegistry {
     config: ConnectionConfig,
     callback: (runtime: ConnectionRuntime) => Promise<T>,
   ): Promise<T> {
+    this.assertOpen();
     const entry = this.entry(config.alias);
     await entry.lock.withWrite(async () => {
+      this.assertOpen();
       if (entry.current?.config.revision === config.revision) return;
       const previous = entry.current;
       entry.current = new ConnectionRuntime(config);
@@ -251,6 +283,7 @@ export class ConnectionRuntimeRegistry {
     });
 
     return entry.lock.withRead(async () => {
+      this.assertOpen();
       if (!entry.current || entry.current.config.revision !== config.revision) {
         throw new PluginError({
           category: 'config_error',
@@ -275,6 +308,19 @@ export class ConnectionRuntimeRegistry {
   }
 
   async closeAll(): Promise<void> {
-    await Promise.all([...this.entries.keys()].map((alias) => this.invalidate(alias)));
+    this.closing = true;
+    this.closePromise ??= Promise.all([...this.entries.keys()].map((alias) => this.invalidate(alias)))
+      .then(() => { this.entries.clear(); });
+    await this.closePromise;
+  }
+
+  forceClose(): void {
+    this.closing = true;
+    for (const entry of this.entries.values()) {
+      const current = entry.current;
+      entry.current = undefined;
+      current?.forceClose();
+    }
+    this.entries.clear();
   }
 }

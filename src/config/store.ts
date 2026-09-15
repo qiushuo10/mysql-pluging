@@ -142,6 +142,7 @@ export class StateStore {
   readonly home: string;
   readonly path: string;
   private readonly database: DatabaseSync;
+  private closed = false;
 
   constructor(home?: string) {
     this.home = resolveStateHome(home);
@@ -1429,7 +1430,9 @@ export class StateStore {
   }
 
   close(): void {
+    if (this.closed) return;
     this.database.close();
+    this.closed = true;
   }
 
   private fromRow(row: ConnectionRow): ConnectionConfig {

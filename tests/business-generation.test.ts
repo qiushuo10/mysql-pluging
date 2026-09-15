@@ -113,7 +113,7 @@ describe('RegistryGenerationManager', () => {
     expect(closed).toBe(1);
   });
 
-  it('allows an already-started reload to finish before shutdown retires its result', async () => {
+  it('closes an already-prepared candidate instead of publishing it after shutdown begins', async () => {
     const order: string[] = [];
     let releasePrepare!: () => void;
     const prepareBlocked = new Promise<void>((resolve) => { releasePrepare = resolve; });
@@ -129,9 +129,23 @@ describe('RegistryGenerationManager', () => {
       registry: registry(() => undefined), value: null,
     }))).rejects.toThrow(/closing/);
     releasePrepare();
-    await reload;
+    await expect(reload).rejects.toThrow(/closing/);
     await shutdown;
-    expect(order).toEqual(['prepare', 'initial-close', 'candidate-close']);
+    expect(order).toEqual(['prepare', 'candidate-close', 'initial-close']);
+  });
+
+  it('force-closes a generation after its drain deadline without waiting for a leaked lease', async () => {
+    let closed = 0;
+    const manager = new RegistryGenerationManager(registry(() => { closed += 1; }));
+    const lease = manager.acquire();
+    manager.forceClose();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closed).toBe(1);
+    expect(() => manager.acquire()).toThrow(/closing/);
+    lease.release();
+    manager.forceClose();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closed).toBe(1);
   });
 
   it('does not close a leased retired generation during shutdown', async () => {

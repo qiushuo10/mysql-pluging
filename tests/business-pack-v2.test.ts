@@ -119,6 +119,10 @@ async function connect(application: MysqlMcpApplication): Promise<Client> {
   await application.server.connect(serverTransport); await client.connect(clientTransport); return client;
 }
 
+function registeredToolNames(application: MysqlMcpApplication): string[] {
+  return Object.keys((application.server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools);
+}
+
 function writeReloadExtra(packs: string): string {
   const extra = join(packs, 'extra');
   mkdirSync(join(extra, 'sql'), { recursive: true });
@@ -144,6 +148,33 @@ operations:
     max_rows: 1
 `);
   return extra;
+}
+
+function writeRotatingPack(packs: string, index: number): string {
+  const directory = join(packs, 'rotating');
+  mkdirSync(join(directory, 'sql'), { recursive: true });
+  writeFileSync(join(directory, 'sql', 'check.sql'), 'SELECT 1 AS ok LIMIT 1');
+  writeFileSync(join(directory, 'pack.yml'), `
+schema_version: mysql-agent/business-pack/2
+pack_id: rotating-${index}
+version: 1.0.0
+operations:
+  - id: rotate${index}.check
+    kind: sql
+    domain: rotate${index}
+    name: check
+    title: 轮换工具 ${index}
+    description: 验证动态工具句柄回收。
+    use_when: 测试工具轮换时。
+    exposure: direct
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input: {}
+    sql_file: sql/check.sql
+    max_rows: 1
+`);
+  return directory;
 }
 
 afterEach(() => { for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true }); });
@@ -199,6 +230,7 @@ operations:
     const removed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(removed.structuredContent).toEqual(expect.objectContaining({ removed_tools: 1, reconnect_recommended: true }));
     expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    expect(registeredToolNames(app)).not.toContain('business__health__check');
 
     const generationBeforeFailure = app.businessGenerationManager!.snapshot().id;
     writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), 'const = invalid syntax');
@@ -319,9 +351,12 @@ operations:
     await client.close(); await app.close();
   });
 
-  it('keeps removed tools disabled and safely reuses their handles on re-add', async () => {
+  it('reaps a tombstone when remove mutates before its hook throws, then safely re-adds the name', async () => {
     const state = fixture();
-    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: { removeTool: (_name, remove) => { remove(); throw new Error('after remove'); } },
+    });
     const client = await connect(app);
     const extra = writeReloadExtra(state.packs);
     expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
@@ -329,10 +364,34 @@ operations:
     const removed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(removed.isError).toBe(false);
     expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    expect(registeredToolNames(app)).not.toContain('business__health__check');
     writeReloadExtra(state.packs);
     const readd = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(readd.isError).toBe(false);
     expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('business__health__check');
+    await client.close(); await app.close();
+  });
+
+  it('keeps internal dynamic tool handles bounded while rotating unique names through failed removals', async () => {
+    const state = fixture();
+    let removalFailures = 0;
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: {
+        removeTool: () => { removalFailures += 1; throw new Error('remove unavailable'); },
+      },
+    });
+    const client = await connect(app);
+    const baseline = registeredToolNames(app).length;
+    for (let index = 0; index < 40; index += 1) {
+      const directory = writeRotatingPack(state.packs, index);
+      expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
+      rmSync(directory, { recursive: true, force: true });
+      expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
+    }
+    expect(removalFailures).toBe(40);
+    expect(registeredToolNames(app).length).toBeLessThanOrEqual(baseline + 1);
+    expect((await client.listTools()).tools.filter((tool) => tool.name.startsWith('business__rotate'))).toEqual([]);
     await client.close(); await app.close();
   });
 
@@ -390,12 +449,52 @@ operations:
       const shutdown = app.close().then(() => { shutdownFinished = true; });
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(shutdownFinished, scenario.tool).toBe(false);
+      const rejected = await client.callTool({ name: 'workspace_validate', arguments: {} });
+      expect(rejected.isError).toBe(true);
+      expect(JSON.stringify(rejected.content)).toContain('正在关闭');
       for (const release of gates) release();
       expect((await call).isError, scenario.tool).toBe(false);
       await shutdown;
       expect(shutdownFinished).toBe(true);
       await client.close();
     }
+  });
+
+  it('aborts and force-closes an uncooperative in-flight call after the bounded drain deadline', async () => {
+    const state = fixture();
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor, shutdownTimeoutMs: 25,
+    });
+    let started!: () => void;
+    const queryStarted = new Promise<void>((resolve) => { started = resolve; });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let shutdownSignal: AbortSignal | undefined;
+    app.service.query = async (request) => {
+      shutdownSignal = request.requestSignal;
+      started();
+      await blocked;
+      return {
+        schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'query', connection: request.connection,
+        business_operation_id: request.businessOperationId ?? null, rows: [], row_count: 0, duration_ms: 1,
+      };
+    };
+    const client = await connect(app);
+    const call = client.callTool({
+      name: 'business__order__read', arguments: { operation: 'find', input: { id: 'A1' } },
+    }).catch(() => undefined);
+    await queryStarted;
+    const startedAt = performance.now();
+    await Promise.all([app.close(), app.close()]);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(app.shutdownGate.snapshot()).toMatchObject({ accepting: false, aborted: true, active: 1 });
+    expect(shutdownSignal?.aborted).toBe(true);
+    await Promise.all([app.forceClose(), app.forceClose()]);
+    release();
+    await call;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(app.shutdownGate.snapshot().active).toBe(0);
+    await client.close().catch(() => undefined);
   });
 
   it('resolves SQL and scripts per environment, keeps public ids stable, and reports disabled targets', () => {

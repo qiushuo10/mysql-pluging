@@ -98,6 +98,13 @@ export class RegistryGenerationManager {
     try {
       if (this.shutdownRequested) throw new Error('RegistryGenerationManager is closing');
       const prepared = await prepare({ registry: this.current.registry, generation: this.publicSnapshot(this.current) });
+      if (this.shutdownRequested) {
+        try { await prepared.registry.close(); } finally {
+          const error = new Error('RegistryGenerationManager is closing');
+          Object.defineProperty(error, 'registryCandidateClosed', { value: true, enumerable: false });
+          throw error;
+        }
+      }
       const previous = this.current;
       const next = this.createState(previous.id + 1, prepared.registry);
       this.current = next;
@@ -154,6 +161,16 @@ export class RegistryGenerationManager {
     return this.shutdownPromise;
   }
 
+  /** Timeout-only path: close runtimes even if a handler failed to release its lease. */
+  forceClose(): void {
+    this.shutdownRequested = true;
+    for (const state of [this.current, ...this.retired]) {
+      state.retired = true;
+      this.retired.add(state);
+      this.startClose(state);
+    }
+  }
+
   private createState(id: number, registry: BusinessOperationRegistry): GenerationState {
     let resolveClosed!: () => void;
     const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
@@ -169,15 +186,21 @@ export class RegistryGenerationManager {
 
   private async closeIfUnused(state: GenerationState): Promise<void> {
     if (!state.retired || state.refs !== 0 || state.closing) return;
-    state.closing = state.registry.close();
-    try { await state.closing; } catch (error) {
+    this.startClose(state);
+    await state.closed;
+  }
+
+  private startClose(state: GenerationState): void {
+    if (state.closing) return;
+    state.closing = Promise.resolve().then(() => state.registry.close());
+    void state.closing.then(() => undefined, (error: unknown) => {
       process.stderr.write(`${JSON.stringify({
         level: 'warn', event: 'registry_generation_close_failed', generation: state.id,
         message: error instanceof Error ? error.message : 'unknown',
       })}\n`);
-    } finally {
+    }).finally(() => {
       state.resolveClosed();
       this.retired.delete(state);
-    }
+    });
   }
 }
