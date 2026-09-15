@@ -4,9 +4,10 @@ import { join } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { loadBusinessOperations, loadBusinessOperationsFromHomes } from '../src/business-packs/loader.js';
+import { BusinessOperationRegistry } from '../src/business-queries/registry.js';
 import { StateStore } from '../src/config/store.js';
 import { PluginError } from '../src/errors.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from '../src/mcp/server.js';
@@ -118,6 +119,33 @@ async function connect(application: MysqlMcpApplication): Promise<Client> {
   await application.server.connect(serverTransport); await client.connect(clientTransport); return client;
 }
 
+function writeReloadExtra(packs: string): string {
+  const extra = join(packs, 'extra');
+  mkdirSync(join(extra, 'sql'), { recursive: true });
+  writeFileSync(join(extra, 'sql', 'health.sql'), 'SELECT 1 AS ok LIMIT 1');
+  writeFileSync(join(extra, 'pack.yml'), `
+schema_version: mysql-agent/business-pack/2
+pack_id: reload-extra
+version: 1.0.0
+operations:
+  - id: health.check
+    kind: sql
+    domain: health
+    name: check
+    title: 健康检查
+    description: 固定健康检查。
+    use_when: 需要检查时。
+    exposure: direct
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input: {}
+    sql_file: sql/health.sql
+    max_rows: 1
+`);
+  return extra;
+}
+
 afterEach(() => { for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true }); });
 
 describe('business pack v2', () => {
@@ -130,11 +158,13 @@ describe('business pack v2', () => {
       rows: [], row_count: 0, duration_ms: 1,
     });
     const client = await connect(app);
+    const noOp = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(noOp.structuredContent).toEqual(expect.objectContaining({ added_tools: 0, updated_tools: 0, removed_tools: 0 }));
     writeFileSync(join(state.packs, 'sample', 'sql', 'find.sql'), 'SELECT :id AS changed_id LIMIT 1');
     const changed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
     expect(changed.isError, JSON.stringify(changed)).toBe(false);
     expect(changed.structuredContent).toEqual(expect.objectContaining({
-      generation: expect.objectContaining({ id: 2 }), reconnect_recommended: false,
+      generation: expect.objectContaining({ id: 3 }), updated_tools: 3, reconnect_recommended: false,
     }));
     const call = await client.callTool({ name: 'business__order__read', arguments: { operation: 'find', input: { id: 'A1' } } });
     expect(call.structuredContent).toEqual(expect.objectContaining({ sql_marker: 'SELECT :id AS changed_id LIMIT 1' }));
@@ -181,6 +211,129 @@ operations:
       last_business_reload: expect.objectContaining({ status: 'error' }),
     }));
     await client.close(); await app.close();
+  });
+
+  it('keeps LKG and closes the candidate when staged registration or metadata update fails', async () => {
+    const state = fixture();
+    let failUpdate = true;
+    let failStage = false;
+    const closeSpy = vi.spyOn(BusinessOperationRegistry.prototype, 'close');
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: {
+        updateTool: (_name, update) => { if (failUpdate) throw new Error('injected update failure'); update(); },
+        stageTool: (_name, register) => { if (failStage) throw new Error('injected register failure'); return register(); },
+      },
+    });
+    const client = await connect(app);
+    writeFileSync(join(state.packs, 'sample', 'sql', 'find.sql'), 'SELECT :id AS changed_id LIMIT 1');
+    const initialGeneration = app.businessGenerationManager!.snapshot().id;
+    const updateFailure = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(updateFailure.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(initialGeneration);
+    expect(closeSpy).toHaveBeenCalled();
+
+    failUpdate = false;
+    failStage = true;
+    const extra = join(state.packs, 'extra');
+    mkdirSync(join(extra, 'sql'), { recursive: true });
+    writeFileSync(join(extra, 'sql', 'health.sql'), 'SELECT 1 AS ok LIMIT 1');
+    writeFileSync(join(extra, 'pack.yml'), `
+schema_version: mysql-agent/business-pack/2
+pack_id: reload-extra
+version: 1.0.0
+operations:
+  - id: health.check
+    kind: sql
+    domain: health
+    name: check
+    title: 健康检查
+    description: 固定健康检查。
+    use_when: 需要检查时。
+    exposure: direct
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input: {}
+    sql_file: sql/health.sql
+    max_rows: 1
+`);
+    const stageFailure = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(stageFailure.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(initialGeneration);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    await client.close(); await app.close();
+    closeSpy.mockRestore();
+  });
+
+  it('commits reload when event persistence and list-changed notifications fail', async () => {
+    const state = fixture();
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: {
+        recordEvent: () => { throw new Error('injected event failure'); },
+        sendListChanged: () => { throw new Error('injected notification failure'); },
+      },
+    });
+    const client = await connect(app);
+    writeFileSync(join(state.packs, 'sample', 'sql', 'find.sql'), 'SELECT :id AS changed_id LIMIT 1');
+    const response = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(response.isError).toBe(false);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(2);
+    await client.close(); await app.close();
+  });
+
+  it('keeps removed tools disabled when handle removal fails and rejects unsafe re-add', async () => {
+    const state = fixture();
+    let failRemove = false;
+    const app = createMysqlMcpApplication({
+      stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor,
+      workspaceReloadHooks: {
+        removeTool: (_name, remove) => { if (failRemove) throw new Error('injected remove failure'); remove(); },
+      },
+    });
+    const client = await connect(app);
+    const extra = writeReloadExtra(state.packs);
+    expect((await client.callTool({ name: 'workspace_business_reload', arguments: {} })).isError).toBe(false);
+    rmSync(extra, { recursive: true, force: true });
+    failRemove = true;
+    const removed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(removed.isError).toBe(false);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    const stableGeneration = app.businessGenerationManager!.snapshot().id;
+    writeReloadExtra(state.packs);
+    const readd = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(readd.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(stableGeneration);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+    await client.close(); await app.close();
+  });
+
+  it('serializes the complete prepare and publication of concurrent reloads', async () => {
+    const state = fixture();
+    const original = BusinessOperationRegistry.prototype.validateScripts;
+    let active = 0;
+    let maximum = 0;
+    const validateSpy = vi.spyOn(BusinessOperationRegistry.prototype, 'validateScripts').mockImplementation(async function (this: BusinessOperationRegistry) {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        await original.call(this);
+      } finally { active -= 1; }
+    });
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    const client = await connect(app);
+    const [first, second] = await Promise.all([
+      client.callTool({ name: 'workspace_business_reload', arguments: {} }),
+      client.callTool({ name: 'workspace_business_reload', arguments: {} }),
+    ]);
+    expect(first.isError).toBe(false);
+    expect(second.isError).toBe(false);
+    expect(maximum).toBe(1);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(3);
+    await client.close(); await app.close();
+    validateSpy.mockRestore();
   });
 
   it('resolves SQL and scripts per environment, keeps public ids stable, and reports disabled targets', () => {

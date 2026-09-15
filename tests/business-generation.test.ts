@@ -52,4 +52,26 @@ describe('RegistryGenerationManager', () => {
     expect(manager.snapshot().id).toBe(1);
     await manager.close();
   });
+
+  it('rolls back publication and closes the candidate before releasing the serialized turn', async () => {
+    let candidateClosed = false;
+    const order: string[] = [];
+    const manager = new RegistryGenerationManager(registry(() => undefined));
+    const failed = manager.serializedReload(async () => ({
+      registry: registry(() => { candidateClosed = true; order.push('candidate-closed'); }),
+      value: null,
+      commit: () => { order.push('commit'); throw new Error('publish failed'); },
+      rollback: () => { order.push('rollback'); },
+    }));
+    const next = manager.serializedReload(async () => {
+      order.push('next-prepare');
+      expect(candidateClosed).toBe(true);
+      return { registry: registry(() => undefined), value: null };
+    });
+    await expect(failed).rejects.toThrow('publish failed');
+    await next;
+    expect(order).toEqual(['commit', 'rollback', 'candidate-closed', 'next-prepare']);
+    expect(manager.snapshot().id).toBe(2);
+    await manager.close();
+  });
 });

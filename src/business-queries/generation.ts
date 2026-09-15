@@ -26,6 +26,17 @@ export interface RegistryLease {
   release(): void;
 }
 
+export interface PreparedRegistryTransaction<T> {
+  registry: BusinessOperationRegistry;
+  value: T;
+  /** Synchronous publication of the already-staged external surface. */
+  commit?: () => void;
+  /** Synchronous best-effort restoration when commit throws. */
+  rollback?: () => void;
+  /** Telemetry/notifications. Failure is logged and never rolls back a committed generation. */
+  afterCommit?: () => void;
+}
+
 export function businessGenerationHash(operations: readonly BusinessOperation[]): string {
   const stable = operations.map((operation) => ({
     registrationId: operation.registrationId,
@@ -68,7 +79,7 @@ export class RegistryGenerationManager {
     };
   }
 
-  async serializedReload<T>(prepare: () => Promise<{ registry: BusinessOperationRegistry; value: T }>): Promise<{
+  async serializedReload<T>(prepare: () => Promise<PreparedRegistryTransaction<T>>): Promise<{
     previous: RegistryGenerationSnapshot;
     current: RegistryGenerationSnapshot;
     value: T;
@@ -83,9 +94,36 @@ export class RegistryGenerationManager {
       const previous = this.current;
       const next = this.createState(previous.id + 1, prepared.registry);
       this.current = next;
+      try {
+        prepared.commit?.();
+      } catch (error) {
+        this.current = previous;
+        try { prepared.rollback?.(); } catch (rollbackError) {
+          process.stderr.write(`${JSON.stringify({
+            level: 'warn', event: 'registry_reload_rollback_failed',
+            message: rollbackError instanceof Error ? rollbackError.message : 'unknown',
+          })}\n`);
+        }
+        try { await prepared.registry.close(); } catch (closeError) {
+          process.stderr.write(`${JSON.stringify({
+            level: 'warn', event: 'registry_reload_candidate_close_failed',
+            message: closeError instanceof Error ? closeError.message : 'unknown',
+          })}\n`);
+        }
+        if (error && typeof error === 'object') {
+          Object.defineProperty(error, 'registryCandidateClosed', { value: true, enumerable: false });
+        }
+        throw error;
+      }
       previous.retired = true;
       this.retired.add(previous);
       void this.closeIfUnused(previous);
+      try { prepared.afterCommit?.(); } catch (error) {
+        process.stderr.write(`${JSON.stringify({
+          level: 'warn', event: 'registry_reload_postcommit_failed',
+          generation: next.id, message: error instanceof Error ? error.message : 'unknown',
+        })}\n`);
+      }
       return { previous: this.publicSnapshot(previous), current: this.publicSnapshot(next), value: prepared.value };
     } finally {
       resolveTurn();

@@ -19,6 +19,7 @@ import type { SchemaSnapshotLoader } from '../mysql/schema.js';
 import { WorkspaceManager, type RuntimeMode } from '../workspace/context.js';
 import { TraceRecorder } from '../trace/recorder.js';
 import { registerWorkspaceTools } from './workspace-tools.js';
+import type { WorkspaceReloadHooks } from './workspace-tools.js';
 import {
   connectionAddSchema,
   connectionListSchema,
@@ -541,6 +542,7 @@ export function createMysqlMcpApplication(options: {
   schemaLoader?: SchemaSnapshotLoader;
   mode?: RuntimeMode;
   workspacePath?: string;
+  workspaceReloadHooks?: WorkspaceReloadHooks;
 } = {}): MysqlMcpApplication {
   const mode = options.mode ?? 'global';
   if (mode === 'workspace' && !options.workspacePath) {
@@ -577,7 +579,7 @@ export function createMysqlMcpApplication(options: {
   const traceRecorder = new TraceRecorder(store);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
   if (workspaceManager) {
-    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, generationManager: businessGenerationManager!, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations });
+    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, generationManager: businessGenerationManager!, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations, reloadHooks: options.workspaceReloadHooks });
   } else {
     registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
     if (mode === 'global') registerBusinessTools(server, service, businessRegistry);

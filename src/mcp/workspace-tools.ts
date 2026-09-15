@@ -311,6 +311,16 @@ interface WorkspaceBusinessDescriptor {
   operations: BusinessOperation[];
 }
 
+export interface WorkspaceReloadHooks {
+  stageTool?: (name: string, register: () => RegisteredTool) => RegisteredTool;
+  updateTool?: (name: string, update: () => void) => void;
+  enableTool?: (name: string, enable: () => void) => void;
+  disableTool?: (name: string, disable: () => void) => void;
+  removeTool?: (name: string, remove: () => void) => void;
+  recordEvent?: (record: () => void) => void;
+  sendListChanged?: (send: () => void) => void;
+}
+
 function workspaceBusinessDescriptors(
   registry: BusinessOperationRegistry,
   store: StateStore,
@@ -360,6 +370,27 @@ function workspaceBusinessSurface(
 ): Map<string, string> {
   return new Map([...workspaceBusinessDescriptors(registry, store, targets)].map(([name, descriptor]) => [
     name, JSON.stringify(z.toJSONSchema(descriptor.inputSchema)),
+  ]));
+}
+
+function workspaceBusinessCatalogSurface(
+  registry: BusinessOperationRegistry,
+  store: StateStore,
+  targets: WorkspaceTarget[],
+): Map<string, string> {
+  return new Map([...workspaceBusinessDescriptors(registry, store, targets)].map(([name, descriptor]) => [
+    name,
+    JSON.stringify({
+      title: descriptor.title,
+      description: descriptor.description,
+      annotations: descriptor.annotations,
+      inputSchema: z.toJSONSchema(descriptor.inputSchema),
+      operations: descriptor.operations.map((operation) => ({
+        registrationId: operation.registrationId,
+        operationHash: operation.operationHash ?? null,
+        scriptHash: operation.scriptHash ?? null,
+      })).sort((left, right) => left.registrationId.localeCompare(right.registrationId)),
+    }),
   ]));
 }
 
@@ -719,6 +750,7 @@ function registerWorkspaceManagementTools(
   businessHandles: Map<string, RegisteredTool>,
   getClientName: () => string,
   recorder: TraceRecorder,
+  reloadHooks: WorkspaceReloadHooks,
 ): void {
   const addTool = (name: string) => registerName(names, name);
   addTool('workspace_datasource_add');
@@ -904,67 +936,158 @@ function registerWorkspaceManagementTools(
   }, () => safe(async () => {
     const candidateHolder: { value?: BusinessOperationRegistry } = {};
     try {
-      let oldSurface = new Map<string, string>();
       const swapped = await generations.serializedReload(async () => {
         const oldLease = generations.acquire();
-        try { oldSurface = workspaceBusinessSurface(oldLease.registry, store, workspaceTargets(manager, store)); }
-        finally { oldLease.release(); }
+        let oldSchemaSurface: Map<string, string>;
+        let oldCatalogSurface: Map<string, string>;
+        const targets = workspaceTargets(manager, store);
+        try {
+          oldSchemaSurface = workspaceBusinessSurface(oldLease.registry, store, targets);
+          oldCatalogSurface = workspaceBusinessCatalogSurface(oldLease.registry, store, targets);
+        } finally { oldLease.release(); }
         const loaded = loadBusinessOperationsFromHomes(manager.context.businessPackPaths, { workspace: manager.context });
         const candidate = new BusinessOperationRegistry(loaded.operations);
         candidateHolder.value = candidate;
         await candidate.validateScripts();
-        const nextSurface = workspaceBusinessSurface(candidate, store, workspaceTargets(manager, store));
-        for (const [name, signature] of nextSurface) {
-          const previous = oldSurface.get(name);
+        const nextDescriptors = workspaceBusinessDescriptors(candidate, store, targets);
+        const nextSchemaSurface = workspaceBusinessSurface(candidate, store, targets);
+        const nextCatalogSurface = workspaceBusinessCatalogSurface(candidate, store, targets);
+        for (const [name, signature] of nextSchemaSurface) {
+          const previous = oldSchemaSurface.get(name);
           if (previous !== undefined && previous !== signature) {
             throw configError('BUSINESS_TOOL_SCHEMA_CHANGED', `工具 ${name} 的输入 schema 发生变化；为避免客户端缓存误解析，本次未切换。`);
           }
         }
-        return { registry: candidate, value: { loaded, nextSurface } };
+        const addedNames = [...nextSchemaSurface.keys()].filter((name) => !oldSchemaSurface.has(name));
+        const removedNames = [...oldSchemaSurface.keys()].filter((name) => !nextSchemaSurface.has(name));
+        const updatedNames = [...nextCatalogSurface.keys()].filter((name) => {
+          const previous = oldCatalogSurface.get(name);
+          return previous !== undefined && previous !== nextCatalogSurface.get(name);
+        });
+        const staged = new Map<string, RegisteredTool>();
+        const metadataRollbacks: Array<() => void> = [];
+        const cleanupStaged = () => {
+          for (const [name, handle] of staged) {
+            try { reloadHooks.removeTool ? reloadHooks.removeTool(name, () => handle.remove()) : handle.remove(); }
+            catch { /* staged tools were never enabled; best effort cleanup is safe */ }
+          }
+          staged.clear();
+        };
+        try {
+          for (const name of updatedNames) {
+            const handle = businessHandles.get(name);
+            const descriptor = nextDescriptors.get(name);
+            if (!handle || !descriptor) throw configError('BUSINESS_TOOL_HANDLE_MISSING', `工具 ${name} 缺少活动注册句柄。`);
+            const previous = { title: handle.title, description: handle.description, annotations: handle.annotations };
+            const update = () => handle.update({ title: descriptor.title, description: descriptor.description, annotations: descriptor.annotations });
+            reloadHooks.updateTool ? reloadHooks.updateTool(name, update) : update();
+            metadataRollbacks.push(() => handle.update(previous));
+          }
+          for (const name of addedNames) {
+            const stale = businessHandles.get(name);
+            if (stale) {
+              const remove = () => stale.remove();
+              reloadHooks.removeTool ? reloadHooks.removeTool(name, remove) : remove();
+              businessHandles.delete(name);
+              names.delete(name);
+            }
+            const descriptor = nextDescriptors.get(name)!;
+            const register = () => registerDynamicBusinessTool({
+              server, descriptor, generations, manager, store, service, getClientName, recorder,
+            });
+            const handle = reloadHooks.stageTool ? reloadHooks.stageTool(name, register) : register();
+            staged.set(name, handle);
+            const disable = () => handle.disable();
+            reloadHooks.disableTool ? reloadHooks.disableTool(name, disable) : disable();
+          }
+        } catch (error) {
+          cleanupStaged();
+          for (const rollback of metadataRollbacks.reverse()) { try { rollback(); } catch { /* best effort */ } }
+          throw error;
+        }
+        const enabledStaged: Array<[string, RegisteredTool]> = [];
+        const disabledRemoved: Array<[string, RegisteredTool]> = [];
+        const rollbackPublication = () => {
+          for (const [name, handle] of enabledStaged.reverse()) {
+            try { reloadHooks.disableTool ? reloadHooks.disableTool(name, () => handle.disable()) : handle.disable(); } catch { /* best effort */ }
+          }
+          for (const [name, handle] of disabledRemoved.reverse()) {
+            try { reloadHooks.enableTool ? reloadHooks.enableTool(name, () => handle.enable()) : handle.enable(); } catch { /* best effort */ }
+          }
+          cleanupStaged();
+          for (const rollback of metadataRollbacks.reverse()) { try { rollback(); } catch { /* best effort */ } }
+        };
+        return {
+          registry: candidate,
+          value: {
+            loaded, added: addedNames.length, removed: removedNames.length, updated: updatedNames.length,
+          },
+          commit: () => {
+            for (const [name, handle] of staged) {
+              const enable = () => handle.enable();
+              reloadHooks.enableTool ? reloadHooks.enableTool(name, enable) : enable();
+              enabledStaged.push([name, handle]);
+            }
+            for (const name of removedNames) {
+              const handle = businessHandles.get(name);
+              if (!handle) continue;
+              const disable = () => handle.disable();
+              reloadHooks.disableTool ? reloadHooks.disableTool(name, disable) : disable();
+              disabledRemoved.push([name, handle]);
+            }
+            for (const [name, handle] of staged) { businessHandles.set(name, handle); names.add(name); }
+            for (const name of removedNames) names.delete(name);
+            disabledState.value = loaded.disabledOperations;
+          },
+          rollback: rollbackPublication,
+          afterCommit: () => {
+            for (const [name, handle] of disabledRemoved) {
+              try {
+                reloadHooks.removeTool ? reloadHooks.removeTool(name, () => handle.remove()) : handle.remove();
+                businessHandles.delete(name);
+              } catch (error) {
+                process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'business_tool_remove_failed', tool: name, message: error instanceof Error ? error.message : 'unknown' })}\n`);
+              }
+            }
+            const published = generations.snapshot();
+            try {
+              const record = () => store.recordBusinessReload({
+                workspaceId: manager.context.workspaceId, generation: published.id, status: 'ok',
+                contentHash: published.hash, addedTools: addedNames.length,
+                updatedTools: updatedNames.length, removedTools: removedNames.length,
+              });
+              reloadHooks.recordEvent ? reloadHooks.recordEvent(record) : record();
+            } catch (error) {
+              process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'business_reload_event_failed', generation: published.id, message: error instanceof Error ? error.message : 'unknown' })}\n`);
+            }
+            try {
+              const notify = () => server.sendToolListChanged();
+              reloadHooks.sendListChanged ? reloadHooks.sendListChanged(notify) : notify();
+            } catch (error) {
+              process.stderr.write(`${JSON.stringify({ level: 'warn', event: 'business_tool_list_changed_failed', generation: published.id, message: error instanceof Error ? error.message : 'unknown' })}\n`);
+            }
+          },
+        };
       });
       delete candidateHolder.value;
-      const nextSurface = swapped.value.nextSurface;
-      const added = [...nextSurface.keys()].filter((name) => !oldSurface.has(name)).length;
-      const removed = [...oldSurface.keys()].filter((name) => !nextSurface.has(name)).length;
-      const updated = [...nextSurface.keys()].filter((name) => oldSurface.has(name)).length;
-      const currentLease = generations.acquire();
-      let descriptors: Map<string, WorkspaceBusinessDescriptor>;
-      try {
-        descriptors = workspaceBusinessDescriptors(currentLease.registry, store, workspaceTargets(manager, store));
-      } finally {
-        currentLease.release();
-      }
-      for (const name of [...businessHandles.keys()]) {
-        businessHandles.get(name)!.remove();
-        businessHandles.delete(name);
-        names.delete(name);
-      }
-      for (const [name, descriptor] of descriptors) {
-        registerName(names, name);
-        businessHandles.set(name, registerDynamicBusinessTool({
-          server, descriptor, generations, manager, store, service, getClientName, recorder,
-        }));
-      }
-      disabledState.value = swapped.value.loaded.disabledOperations;
-      store.recordBusinessReload({
-        workspaceId: manager.context.workspaceId, generation: swapped.current.id, status: 'ok',
-        contentHash: swapped.current.hash, addedTools: added, updatedTools: updated, removedTools: removed,
-      });
-      if (added > 0 || removed > 0) server.sendToolListChanged();
       return result('workspace_business_reload', {
         generation: swapped.current, previous_generation: swapped.previous,
-        added_tools: added, updated_tools: updated, removed_tools: removed,
+        added_tools: swapped.value.added, updated_tools: swapped.value.updated, removed_tools: swapped.value.removed,
         disabled_business_operations: swapped.value.loaded.disabledOperations,
-        reconnect_recommended: added > 0 || removed > 0,
+        reconnect_recommended: swapped.value.added > 0 || swapped.value.removed > 0,
       });
     } catch (error) {
-      if (candidateHolder.value) await candidateHolder.value.close();
+      if (candidateHolder.value && !(error && typeof error === 'object'
+        && (error as { registryCandidateClosed?: unknown }).registryCandidateClosed === true)) {
+        await candidateHolder.value.close();
+      }
       const normalized = unknownError(error);
       try {
-        store.recordBusinessReload({
+        const record = () => store.recordBusinessReload({
           workspaceId: manager.context.workspaceId, generation: generations.snapshot().id,
           status: 'error', contentHash: generations.snapshot().hash, errorCode: normalized.code,
         });
+        reloadHooks.recordEvent ? reloadHooks.recordEvent(record) : record();
       } catch { /* reload outcome remains authoritative even if telemetry is unavailable */ }
       throw error;
     }
@@ -981,6 +1104,7 @@ export function registerWorkspaceTools(input: {
   getClientName: () => string;
   recorder?: TraceRecorder;
   disabledOperations?: readonly DisabledBusinessOperation[];
+  reloadHooks?: WorkspaceReloadHooks;
 }): void {
   const names = new Set<string>();
   const businessHandles = new Map<string, RegisteredTool>();
@@ -1109,5 +1233,5 @@ export function registerWorkspaceTools(input: {
   }));
 
   registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName, recorder, input.generationManager, businessHandles);
-  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service, disabledState, input.generationManager, businessHandles, input.getClientName, recorder);
+  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service, disabledState, input.generationManager, businessHandles, input.getClientName, recorder, input.reloadHooks ?? {});
 }
