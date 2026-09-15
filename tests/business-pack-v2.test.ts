@@ -273,6 +273,66 @@ describe('business pack v2', () => {
     await client.close(); await app.close();
   });
 
+  it.each([
+    ['PluginError then ZodError', `
+      const input = await workflow.input();
+      try { await operations.call('order.find', input); } catch {}
+      return operations.call('proof.find', { id: 123 });
+    `],
+    ['ZodError then PluginError', `
+      const input = await workflow.input();
+      try { await operations.call('order.find', { id: 123 }); } catch {}
+      return operations.call('proof.find', input);
+    `],
+  ] as const)('does not restore a PluginError for mixed host failures: %s', async (_label, source) => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), source);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => {
+      throw new PluginError({ category: 'permission_error', code: 'MIXED_PLUGIN_ERROR', message: 'mixed-plugin-secret' });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'internal_error', code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(JSON.stringify(response)).not.toMatch(/MIXED_PLUGIN_ERROR|mixed-plugin-secret|invalid_type/);
+    await client.close(); await app.close();
+  });
+
+  it('keeps a single non-PluginError host failure generic', async () => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      return operations.call('order.find', { id: 123 });
+    `);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'internal_error', code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(JSON.stringify(response)).not.toMatch(/invalid_type|expected string|received number/);
+    await client.close(); await app.close();
+  });
+
+  it('allows a script to catch mixed host failures and complete successfully', async () => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      const input = await workflow.input();
+      try { await operations.call('order.find', input); } catch {}
+      try { await operations.call('proof.find', { id: 123 }); } catch {}
+      return { recovered: true };
+    `);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => {
+      throw new PluginError({ category: 'permission_error', code: 'CAUGHT_PLUGIN_ERROR', message: 'caught-plugin-secret' });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ output: { recovered: true } }));
+    expect(JSON.stringify(response)).not.toMatch(/CAUGHT_PLUGIN_ERROR|caught-plugin-secret|invalid_type/);
+    await client.close(); await app.close();
+  });
+
   it('returns a generic error instead of guessing between concurrent host failures', async () => {
     const state = fixture();
     const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });

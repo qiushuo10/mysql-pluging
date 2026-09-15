@@ -279,6 +279,7 @@ export class BusinessOperationRegistry {
     let stepIndex = 0;
     const trackedChildren: TrackedChild[] = [];
     const hostErrors: SafeHostError[] = [];
+    let hostFailureCount = 0;
     let runtimeResult: Awaited<ReturnType<BusinessScriptRuntime['execute']>> | undefined;
     let runtimeError: unknown;
     try {
@@ -348,6 +349,7 @@ export class BusinessOperationRegistry {
             trackedChildren.push(tracked);
             return await work;
           } catch (error) {
+            hostFailureCount += 1;
             if (error instanceof PluginError) hostErrors.push(safeHostPluginError(error));
             throw new Error('业务脚本内部操作失败。');
           }
@@ -382,8 +384,8 @@ export class BusinessOperationRegistry {
     if (runtimeError !== undefined) {
       const code = (runtimeError as { code?: unknown })?.code;
       // run@2.1.4 and the provider-neutral adapter do not retain per-request identity on the mapped error.
-      // Restore semantics only when exactly one host failure exists; multiple candidates must stay generic.
-      if (code === 'BUSINESS_SCRIPT_HOST_CALL_FAILED' && hostErrors.length === 1) {
+      // Restore semantics only when the sole host failure is a PluginError; unknown or multiple failures stay generic.
+      if (code === 'BUSINESS_SCRIPT_HOST_CALL_FAILED' && hostFailureCount === 1 && hostErrors.length === 1) {
         throw restoredHostError(hostErrors[0]!);
       }
       throw runtimeError;
