@@ -51,6 +51,14 @@ export interface AddConnectionInput {
 
 export type UpdateConnectionInput = Partial<Omit<AddConnectionInput, 'alias'>> & { alias: string };
 
+export interface ConnectionIdentity {
+  alias: string;
+  datasourceId: string;
+  environment: ConnectionEnvironment;
+  ownerScope: string;
+  revision: number;
+}
+
 interface ConnectionRow {
   alias: string;
   datasource_id: string | null;
@@ -304,6 +312,17 @@ export class StateStore {
         }
         this.recordMigration(7);
       }
+      if (current < 8) {
+        this.database.exec(`
+          CREATE TABLE IF NOT EXISTS workspace_identities (
+            workspace_id TEXT PRIMARY KEY,
+            root_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+          );
+        `);
+        this.recordMigration(8);
+      }
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -444,7 +463,7 @@ export class StateStore {
     return this.toSummary(this.requireConnection(input.alias));
   }
 
-  updateConnection(input: UpdateConnectionInput): ConnectionSummary {
+  updateConnection(input: UpdateConnectionInput, expected?: ConnectionIdentity): ConnectionSummary {
     const existing = this.requireConnection(input.alias);
     const next: AddConnectionInput = {
       alias: existing.alias,
@@ -481,6 +500,7 @@ export class StateStore {
           pool_max = ?, idle_timeout_ms = ?, enabled = ?, revision = revision + 1,
           updated_at = ?
         WHERE alias = ?
+          ${expected ? 'AND datasource_id = ? AND environment = ? AND owner_scope = ? AND revision = ?' : ''}
       `).run(
         next.datasourceId ?? next.alias,
         next.environment ?? 'custom',
@@ -502,8 +522,15 @@ export class StateStore {
         next.enabled === false ? 0 : 1,
         now,
         input.alias,
+        ...(expected ? [expected.datasourceId, expected.environment, expected.ownerScope, expected.revision] : []),
       );
       if (updated.changes === 0) {
+        if (expected) {
+          throw new PluginError({
+            category: 'permission_error', code: 'AUTH_TARGET_CHANGED',
+            message: `连接 ${input.alias} 的授权目标或 revision 已变化，请重新读取后重试。`, retryable: true,
+          });
+        }
         throw new PluginError({ category: 'config_error', code: 'CONNECTION_NOT_FOUND', message: `找不到数据源 ${input.alias}。` });
       }
       this.database.prepare('DELETE FROM schema_snapshots WHERE connection_alias = ?').run(input.alias);
@@ -537,18 +564,27 @@ export class StateStore {
     });
   }
 
-  removeConnection(alias: string): boolean {
+  removeConnection(alias: string, expected?: ConnectionIdentity): boolean {
     this.database.exec('BEGIN IMMEDIATE');
     try {
-      this.database.prepare('DELETE FROM schema_snapshots WHERE connection_alias = ?').run(alias);
-      const result = this.database.prepare('DELETE FROM connections WHERE alias = ?').run(alias);
+      const result = this.database.prepare(`
+        DELETE FROM connections WHERE alias = ?
+        ${expected ? 'AND datasource_id = ? AND environment = ? AND owner_scope = ? AND revision = ?' : ''}
+      `).run(alias, ...(expected ? [expected.datasourceId, expected.environment, expected.ownerScope, expected.revision] : []));
       if (result.changes === 0) {
+        if (expected) {
+          throw new PluginError({
+            category: 'permission_error', code: 'AUTH_TARGET_CHANGED',
+            message: `连接 ${alias} 的授权目标或 revision 已变化，未执行删除。`, retryable: true,
+          });
+        }
         throw new PluginError({
           category: 'config_error',
           code: 'CONNECTION_NOT_FOUND',
           message: `找不到数据源 ${alias}。`,
         });
       }
+      this.database.prepare('DELETE FROM schema_snapshots WHERE connection_alias = ?').run(alias);
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -581,6 +617,45 @@ export class StateStore {
       .prepare(`SELECT * FROM connections ${includeDisabled ? '' : 'WHERE enabled = 1'} ORDER BY alias`)
       .all() as unknown as ConnectionRow[];
     return rows.map((row) => this.toSummary(this.fromRow(row)));
+  }
+
+  assertConnectionIdentity(expected: ConnectionIdentity): ConnectionConfig {
+    const connection = this.requireConnection(expected.alias);
+    if (connection.datasourceId !== expected.datasourceId
+      || connection.environment !== expected.environment
+      || connection.ownerScope !== expected.ownerScope
+      || connection.revision !== expected.revision) {
+      throw new PluginError({
+        category: 'permission_error', code: 'AUTH_TARGET_CHANGED',
+        message: `连接 ${expected.alias} 的授权目标或 revision 已变化，请重新解析 workspace binding。`, retryable: true,
+      });
+    }
+    return connection;
+  }
+
+  registerWorkspaceIdentity(workspaceId: string, rootHash: string): void {
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.database.prepare('SELECT root_hash FROM workspace_identities WHERE workspace_id = ?')
+        .get(workspaceId) as { root_hash: string } | undefined;
+      if (existing && existing.root_hash !== rootHash) {
+        throw new PluginError({
+          category: 'permission_error', code: 'WORKSPACE_IDENTITY_ROOT_MISMATCH',
+          message: `workspace_id ${workspaceId} 已绑定到另一个 root；本期不允许隐式迁移。`,
+        });
+      }
+      if (existing) {
+        this.database.prepare('UPDATE workspace_identities SET last_seen_at = ? WHERE workspace_id = ?').run(now, workspaceId);
+      } else {
+        this.database.prepare('INSERT INTO workspace_identities(workspace_id, root_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?)')
+          .run(workspaceId, rootHash, now, now);
+      }
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   recordAudit(record: AuditRecord): void {

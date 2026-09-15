@@ -557,6 +557,14 @@ export function createMysqlMcpApplication(options: {
         : loadBusinessOperations(options.businessPacksHome);
   const businessRegistry = new BusinessOperationRegistry(loaded.operations);
   const store = new StateStore(options.stateHome);
+  if (workspaceManager) {
+    try {
+      store.registerWorkspaceIdentity(workspaceManager.context.workspaceId, workspaceManager.context.rootHash);
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+  }
   const service = new MysqlService(store, undefined, options.schemaLoader);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
   if (workspaceManager) {

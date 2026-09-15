@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { ALIAS_PATTERN, MAX_AFFECTED_ROWS, MAX_MAX_ROWS } from '../constants.js';
 import { PluginError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
+import type { ConnectionIdentity } from '../config/store.js';
 import { compileNamedParameters, discoverNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
 import type { SqlParameters, SqlScalar } from '../types.js';
@@ -145,7 +146,13 @@ export class BusinessOperationRegistry {
     service: MysqlService,
     signal?: AbortSignal,
     clientName?: string,
-    executionContext?: { workspaceId: string; datasourceId: string; environment: ConnectionEnvironment },
+    executionContext?: {
+      workspaceId: string;
+      datasourceId: string;
+      environment: ConnectionEnvironment;
+      expectedConnection?: ConnectionIdentity;
+      publicOperationId?: string;
+    },
   ): Promise<Record<string, unknown>> {
     const parameters = parseBusinessParameters(operation, input);
     if (operation.mode === 'read') {
@@ -155,7 +162,7 @@ export class BusinessOperationRegistry {
         parameters,
         maxRows: operation.maxRows,
         timeoutMs: operation.timeoutMs,
-        businessOperationId: operation.id,
+        businessOperationId: executionContext?.publicOperationId ?? operation.id,
         businessPackId: operation.packId,
         businessPackVersion: operation.packVersion,
         businessOperationHash: operation.operationHash,
@@ -165,6 +172,7 @@ export class BusinessOperationRegistry {
         workspaceId: executionContext?.workspaceId,
         datasourceId: executionContext?.datasourceId,
         environment: executionContext?.environment,
+        expectedConnection: executionContext?.expectedConnection,
       });
     }
     return service.execute({
@@ -173,7 +181,7 @@ export class BusinessOperationRegistry {
       parameters,
       timeoutMs: operation.timeoutMs,
       maxAffectedRows: operation.maxAffectedRows,
-      businessOperationId: operation.id,
+      businessOperationId: executionContext?.publicOperationId ?? operation.id,
       businessPackId: operation.packId,
       businessPackVersion: operation.packVersion,
       businessOperationHash: operation.operationHash,
@@ -183,6 +191,7 @@ export class BusinessOperationRegistry {
       workspaceId: executionContext?.workspaceId,
       datasourceId: executionContext?.datasourceId,
       environment: executionContext?.environment,
+      expectedConnection: executionContext?.expectedConnection,
     });
   }
 }

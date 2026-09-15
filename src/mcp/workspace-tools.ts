@@ -7,7 +7,7 @@ import { z } from 'zod';
 
 import type { BusinessOperation } from '../business-queries/definition.js';
 import { BusinessOperationRegistry } from '../business-queries/registry.js';
-import type { AddConnectionInput, StateStore } from '../config/store.js';
+import type { AddConnectionInput, ConnectionIdentity, StateStore } from '../config/store.js';
 import { PluginError, unknownError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
 import type { ConnectionEnvironment, ConnectionSummary } from '../types.js';
@@ -34,6 +34,7 @@ interface WorkspaceTarget {
   alias: string;
   policy: WorkspaceEnvironment;
   genericSuffix: string;
+  identity: ConnectionIdentity;
 }
 
 function result(kind: string, data: Record<string, unknown>): CallToolResult {
@@ -73,7 +74,11 @@ async function invalidateRuntimeBestEffort(service: MysqlService, alias: string)
   }
 }
 
-function validateBinding(store: StateStore, workspace: WorkspaceContext, target: Omit<WorkspaceTarget, 'policy' | 'genericSuffix'>): ConnectionSummary {
+function validateBinding(
+  store: StateStore,
+  workspace: WorkspaceContext,
+  target: Pick<WorkspaceTarget, 'datasourceId' | 'environment' | 'alias'>,
+): ConnectionSummary {
   const connection = store.requireConnection(target.alias);
   if (!connection.enabled) throw configError('WORKSPACE_CONNECTION_DISABLED', `binding ${target.datasourceId}/${target.environment} 指向已停用连接。`);
   if (connection.datasourceId !== target.datasourceId || connection.environment !== target.environment) {
@@ -97,6 +102,16 @@ function validateBinding(store: StateStore, workspace: WorkspaceContext, target:
   return summary;
 }
 
+function identityOf(connection: ConnectionSummary): ConnectionIdentity {
+  return {
+    alias: connection.alias,
+    datasourceId: connection.datasourceId ?? connection.alias,
+    environment: connection.environment ?? 'custom',
+    ownerScope: connection.ownerScope ?? 'global',
+    revision: connection.revision,
+  };
+}
+
 export function workspaceTargets(manager: WorkspaceManager, store: StateStore): WorkspaceTarget[] {
   const workspace = manager.context;
   const targets: WorkspaceTarget[] = [];
@@ -113,7 +128,8 @@ export function workspaceTargets(manager: WorkspaceManager, store: StateStore): 
       const suffix = isDefault && environment !== 'prod'
         ? ''
         : [environmentPrefix, datasourceSuffix].filter(Boolean).join('__');
-      targets.push({ datasourceId, environment, alias, policy, genericSuffix: suffix });
+      const connection = validateBinding(store, workspace, { datasourceId, environment, alias });
+      targets.push({ datasourceId, environment, alias, policy, genericSuffix: suffix, identity: identityOf(connection) });
     }
   }
   const defaultTarget = targets.find((target) =>
@@ -125,13 +141,13 @@ export function workspaceTargets(manager: WorkspaceManager, store: StateStore): 
 }
 
 function liveTarget(manager: WorkspaceManager, store: StateStore, source: WorkspaceTarget): WorkspaceTarget {
-  const workspace = manager.context;
   const alias = manager.binding(source.datasourceId, source.environment);
+  const workspace = manager.context;
   if (!alias) throw configError('WORKSPACE_BINDING_NOT_FOUND', `binding ${source.datasourceId}/${source.environment} 已不存在，请重新连接。`);
   const policy = workspace.environments.get(source.environment);
   if (!policy) throw configError('WORKSPACE_ENVIRONMENT_NOT_FOUND', `环境 ${source.environment} 已不存在，请重新连接。`);
-  validateBinding(store, workspace, { datasourceId: source.datasourceId, environment: source.environment, alias });
-  return { ...source, alias, policy };
+  const connection = validateBinding(store, workspace, { datasourceId: source.datasourceId, environment: source.environment, alias });
+  return { ...source, alias, policy, identity: identityOf(connection) };
 }
 
 function publicWorkspaceResult(data: Record<string, unknown>, target: WorkspaceTarget): Record<string, unknown> {
@@ -165,8 +181,8 @@ function annotations(operation: BusinessOperation): ToolAnnotations {
   };
 }
 
-function businessPrefix(workspace: WorkspaceContext, target: WorkspaceTarget): string {
-  return target.environment === 'prod' || target.environment !== workspace.defaultEnvironment ? `${target.environment}__` : '';
+function businessPrefix(target: WorkspaceTarget): string {
+  return target.genericSuffix ? `${target.genericSuffix}__` : '';
 }
 
 function matchingOperations(registry: BusinessOperationRegistry, store: StateStore, target: WorkspaceTarget): BusinessOperation[] {
@@ -200,6 +216,7 @@ function registerBoundDataTools(
       connection: target.alias, sql: args.sql, parameters: args.parameters, maxRows: args.max_rows,
       timeoutMs: args.timeout_ms, requestSignal: extra.signal, clientName: getClientName(),
       workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
+      expectedConnection: target.identity,
     });
     return result('query', publicWorkspaceResult(value, target));
   }));
@@ -249,6 +266,7 @@ function registerBoundDataTools(
         connection: target.alias, sql: args.sql, parameters: args.parameters, timeoutMs: args.timeout_ms,
         maxAffectedRows: args.max_affected_rows, requestSignal: extra.signal, clientName: getClientName(),
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
+        expectedConnection: target.identity,
       });
       return result('execute', publicWorkspaceResult(value, target));
     }));
@@ -271,7 +289,7 @@ function registerWorkspaceBusinessTools(
   }
 
   for (const item of visible.filter(({ operation }) => operation.exposure === 'direct')) {
-    const prefix = businessPrefix(manager.context, item.target);
+    const prefix = businessPrefix(item.target);
     const toolName = `business__${prefix}${item.operation.domain}__${item.operation.name}`;
     registerName(names, toolName);
     server.registerTool(toolName, {
@@ -286,6 +304,7 @@ function registerWorkspaceBusinessTools(
       }
       const value = await registry.execute(item.operation, args, service, extra.signal, getClientName(), {
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
+        expectedConnection: target.identity, publicOperationId: publicOperationId(item.operation, target),
       });
       return result('business_operation', publicWorkspaceResult(value, target));
     }));
@@ -294,7 +313,7 @@ function registerWorkspaceBusinessTools(
   const groups = new Map<string, Array<{ target: WorkspaceTarget; operation: BusinessOperation }>>();
   for (const item of visible.filter(({ operation }) => operation.exposure === 'domain')) {
     const lane = item.operation.mode === 'read' ? 'read' : 'write';
-    const key = `${businessPrefix(manager.context, item.target)}${item.operation.domain}\u0000${lane}`;
+    const key = `${businessPrefix(item.target)}${item.operation.domain}\u0000${lane}`;
     const group = groups.get(key) ?? [];
     group.push(item);
     groups.set(key, group);
@@ -325,6 +344,7 @@ function registerWorkspaceBusinessTools(
       }
       const value = await registry.execute(selected.operation, parsed.input, service, extra.signal, getClientName(), {
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
+        expectedConnection: target.identity, publicOperationId: publicOperationId(selected.operation, target),
       });
       return result('business_operation', publicWorkspaceResult(value, target));
     }));
@@ -335,7 +355,7 @@ function registerWorkspaceBusinessTools(
     title: '查找当前工作空间业务操作', description: '只列出当前工作空间已解析且暴露的业务操作；不接受物理连接 alias。',
     inputSchema: workspaceListBusinessOperationsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, (args) => safe(() => {
+  }, (args) => safe(async () => {
     const keyword = args.keyword?.toLowerCase();
     const operations = visible
       .filter(({ operation }) => !args.domain || operation.domain === args.domain)
@@ -399,7 +419,7 @@ function registerWorkspaceManagementTools(
     title: '新增工作空间数据源', description: '创建当前工作空间自有的 dev/test/staging 连接并原子写入 binding；不回显密码。',
     inputSchema: workspaceDatasourceAddSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  }, (args) => safe(() => {
+  }, (args) => safe(async () => {
     if (args.environment === 'prod' || args.environment === 'custom') {
       throw configError('WORKSPACE_DATASOURCE_ADD_ENVIRONMENT_FORBIDDEN', 'workspace_datasource_add 只允许 dev/test/staging；prod 必须由 admin 创建后绑定。');
     }
@@ -408,11 +428,25 @@ function registerWorkspaceManagementTools(
       throw configError('WORKSPACE_BINDING_ALREADY_EXISTS', `binding ${args.datasource_id}/${args.environment} 已存在。`);
     }
     const summary = store.addConnection(connectionInput(args, manager.context.workspaceId));
+    let bindingCommitted = false;
     try {
-      manager.setBinding(args.datasource_id, args.environment, args.alias, args.make_default);
+      await manager.setBinding(args.datasource_id, args.environment, args.alias, args.make_default, { requireAbsent: true });
+      bindingCommitted = true;
+      store.assertConnectionIdentity(identityOf(summary));
     } catch (error) {
+      if (bindingCommitted) {
+        try {
+          await manager.removeBinding(args.datasource_id, args.environment, { expectedAlias: args.alias });
+        } catch (compensationError) {
+          throw configError(
+            'PARTIAL_CONFIGURATION',
+            `连接 ${args.alias} 已创建但并发校验失败，且 binding 补偿失败；请重新连接后核对配置。`,
+            { error, compensationError },
+          );
+        }
+      }
       try {
-        store.removeConnection(args.alias);
+        store.removeConnection(args.alias, identityOf(summary));
       } catch (compensationError) {
         throw configError(
           'PARTIAL_CONFIGURATION',
@@ -433,9 +467,34 @@ function registerWorkspaceManagementTools(
     title: '绑定已有数据源', description: '只允许绑定当前工作空间自有连接，或 global 且 shareable 的连接。',
     inputSchema: workspaceDatasourceBindSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  }, (args) => safe(() => {
-    validateBinding(store, manager.context, { datasourceId: args.datasource_id, environment: args.environment, alias: args.alias });
-    manager.setBinding(args.datasource_id, args.environment, args.alias, args.make_default);
+  }, (args) => safe(async () => {
+    const priorAlias = manager.binding(args.datasource_id, args.environment);
+    const connection = validateBinding(store, manager.context, { datasourceId: args.datasource_id, environment: args.environment, alias: args.alias });
+    await manager.setBinding(
+      args.datasource_id,
+      args.environment,
+      args.alias,
+      args.make_default,
+      priorAlias === undefined ? { requireAbsent: true } : { expectedAlias: priorAlias },
+    );
+    try {
+      store.assertConnectionIdentity(identityOf(connection));
+    } catch (error) {
+      try {
+        if (priorAlias === undefined) {
+          await manager.removeBinding(args.datasource_id, args.environment, { expectedAlias: args.alias });
+        } else {
+          await manager.setBinding(args.datasource_id, args.environment, priorAlias, false, { expectedAlias: args.alias });
+        }
+      } catch (compensationError) {
+        throw configError(
+          'PARTIAL_CONFIGURATION',
+          `binding ${args.datasource_id}/${args.environment} 并发校验失败且补偿失败；请重新连接后核对配置。`,
+          { error, compensationError },
+        );
+      }
+      throw error;
+    }
     return result('workspace_datasource_bind', {
       datasource_id: args.datasource_id, environment: args.environment,
       reconnect_required: true, reason: '工具目录发生变化；请重新连接以刷新绑定目标。',
@@ -466,7 +525,7 @@ function registerWorkspaceManagementTools(
     }
     const toolSurfaceChanged = (args.access_mode !== undefined && args.access_mode !== connection.accessMode)
       || (args.enabled !== undefined && args.enabled !== connection.enabled);
-    const summary = store.updateConnection(updateInput(args, alias));
+    const summary = store.updateConnection(updateInput(args, alias), identityOf(connection));
     await invalidateRuntimeBestEffort(service, alias);
     return result('workspace_datasource_update', {
       datasource_id: args.datasource_id, environment: args.environment, connection: summary,
@@ -492,14 +551,14 @@ function registerWorkspaceManagementTools(
         throw configError('WORKSPACE_CONNECTION_STILL_REFERENCED', `连接 ${alias} 仍被当前工作空间其他 binding 引用。`);
       }
     }
-    manager.removeBinding(args.datasource_id, args.environment);
+    await manager.removeBinding(args.datasource_id, args.environment, { expectedAlias: alias });
     let deleted = false;
     if (args.delete_owned_connection) {
       try {
-        store.removeConnection(alias);
+        store.removeConnection(alias, identityOf(connection));
         deleted = true;
       } catch (error) {
-        try { manager.setBinding(args.datasource_id, args.environment, alias); }
+        try { await manager.setBinding(args.datasource_id, args.environment, alias, false, { requireAbsent: true }); }
         catch (compensationError) {
           throw configError('PARTIAL_CONFIGURATION', `连接 ${alias} 删除失败且 binding 补偿失败；请使用 admin 模式核对连接和 descriptor。`, { error, compensationError });
         }

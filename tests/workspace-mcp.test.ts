@@ -115,7 +115,7 @@ describe('workspace MCP tool surface', () => {
         operation('work_order.find.auto-dev', 'auto-dev'),
         operation('work_order.find.auto-prod', 'auto-prod'),
         writeOperation('work_order.mark.auto-prod', 'auto-prod'),
-        operation('proofline.find.proof-test', 'proof-test', 'proofline'),
+        operation('work_order.find.proof-test', 'proof-test'),
       ],
     });
     const client = await connect(workspace);
@@ -125,7 +125,7 @@ describe('workspace MCP tool surface', () => {
       'sql_query', 'schema_search', 'schema_describe', 'sql_execute',
       'sql_query__proofline', 'schema_search__proofline', 'sql_execute__proofline',
       'sql_query__prod', 'schema_search__prod', 'schema_describe__prod',
-      'business__work_order__read', 'business__proofline__read', 'business__prod__work_order__read',
+      'business__work_order__read', 'business__proofline__work_order__read', 'business__prod__work_order__read',
       'workspace_datasource_add', 'workspace_datasource_bind', 'workspace_datasource_list',
       'workspace_datasource_update', 'workspace_datasource_remove', 'workspace_validate',
     ]));
@@ -147,7 +147,15 @@ describe('workspace MCP tool surface', () => {
     const business = await client.callTool({
       name: 'business__prod__work_order__read', arguments: { operation: 'find', input: { id: 'A1' } },
     });
-    expect(business.structuredContent).toEqual(expect.objectContaining({ datasource_id: 'autoserver', environment: 'prod' }));
+    expect(business.structuredContent).toEqual(expect.objectContaining({
+      datasource_id: 'autoserver', environment: 'prod', business_operation_id: 'work_order.find',
+    }));
+    const prooflineBusiness = await client.callTool({
+      name: 'business__proofline__work_order__read', arguments: { operation: 'find', input: { id: 'A1' } },
+    });
+    expect(prooflineBusiness.structuredContent).toEqual(expect.objectContaining({
+      datasource_id: 'proofline', environment: 'test', business_operation_id: 'work_order.find',
+    }));
     const listed = await client.callTool({ name: 'list_business_operations', arguments: {} });
     expect(JSON.stringify(listed.structuredContent)).not.toContain('auto-dev');
     expect(JSON.stringify(listed.structuredContent)).not.toContain('auto-prod');
@@ -221,7 +229,7 @@ describe('workspace MCP tool surface', () => {
   it('compensates a new connection when the descriptor update fails', async () => {
     const state = fixture();
     const application = createMysqlMcpApplication({ stateHome: state.home, mode: 'workspace', workspacePath: state.descriptor, operations: [] });
-    application.workspaceManager!.setBinding = () => { throw new Error('simulated rename failure'); };
+    application.workspaceManager!.setBinding = async () => { throw new Error('simulated rename failure'); };
     const client = await connect(application);
     const response = await client.callTool({
       name: 'workspace_datasource_add', arguments: {
@@ -232,6 +240,22 @@ describe('workspace MCP tool surface', () => {
     expect(response.isError).toBe(true);
     expect(application.store.getConnection('temp-stage')).toBeNull();
     await client.close();
+    await application.close();
+  });
+
+  it('rejects SQL execution when the resolved connection revision changes', async () => {
+    const state = fixture();
+    const application = createMysqlMcpApplication({ stateHome: state.home, mode: 'workspace', workspacePath: state.descriptor, operations: [] });
+    const original = application.store.requireConnection('auto-dev');
+    const expectedConnection = {
+      alias: original.alias, datasourceId: original.datasourceId!, environment: original.environment!,
+      ownerScope: original.ownerScope!, revision: original.revision,
+    };
+    application.store.updateConnection({ alias: 'auto-dev', description: 'concurrent admin update' });
+    await expect(application.service.query({
+      connection: 'auto-dev', sql: 'SELECT 1 LIMIT 1', expectedConnection,
+      workspaceId: 'auto-server', datasourceId: 'autoserver', environment: 'test',
+    })).rejects.toMatchObject({ code: 'AUTH_TARGET_CHANGED' });
     await application.close();
   });
 });

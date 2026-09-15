@@ -4,9 +4,12 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -125,7 +128,7 @@ function parseWorkspaceDocument(descriptorPath: string): WorkspaceDocument {
 }
 
 function toContext(descriptorPath: string, document: WorkspaceDocument): WorkspaceContext {
-  const descriptorDirectory = dirname(descriptorPath);
+  const descriptorDirectory = dirname(realpathSync(descriptorPath));
   const environments = new Map<ConnectionEnvironment, WorkspaceEnvironment>();
   for (const [name, environment] of Object.entries(document.environments)) {
     const typedName = name as ConnectionEnvironment;
@@ -153,8 +156,10 @@ function toContext(descriptorPath: string, document: WorkspaceDocument): Workspa
 }
 
 export function loadWorkspaceContext(explicitPath: string): WorkspaceContext {
-  const descriptorPath = resolve(explicitPath);
-  return toContext(descriptorPath, parseWorkspaceDocument(descriptorPath));
+  const resolvedPath = resolve(explicitPath);
+  const document = parseWorkspaceDocument(resolvedPath);
+  const descriptorPath = realpathSync(resolvedPath);
+  return toContext(descriptorPath, document);
 }
 
 export function parseRuntimeOptions(
@@ -192,11 +197,16 @@ export function parseRuntimeOptions(
 export class WorkspaceManager {
   private document: WorkspaceDocument;
   private current: WorkspaceContext;
+  private readonly identityWorkspaceId: string;
+  private readonly identityRootHash: string;
 
   constructor(path: string) {
-    const descriptorPath = resolve(path);
-    this.document = parseWorkspaceDocument(descriptorPath);
+    const resolvedPath = resolve(path);
+    this.document = parseWorkspaceDocument(resolvedPath);
+    const descriptorPath = realpathSync(resolvedPath);
     this.current = toContext(descriptorPath, this.document);
+    this.identityWorkspaceId = this.current.workspaceId;
+    this.identityRootHash = this.current.rootHash;
   }
 
   get context(): WorkspaceContext {
@@ -204,10 +214,12 @@ export class WorkspaceManager {
   }
 
   binding(datasource: string, environment: ConnectionEnvironment): string | undefined {
+    this.refreshFromDisk();
     return this.current.environments.get(environment)?.datasourceBindings[datasource];
   }
 
   allBindings(): Array<{ datasourceId: string; environment: ConnectionEnvironment; alias: string }> {
+    this.refreshFromDisk();
     const result: Array<{ datasourceId: string; environment: ConnectionEnvironment; alias: string }> = [];
     for (const [environment, config] of this.current.environments) {
       for (const [datasourceId, alias] of Object.entries(config.datasourceBindings)) {
@@ -217,39 +229,88 @@ export class WorkspaceManager {
     return result;
   }
 
-  setBinding(datasource: string, environment: ConnectionEnvironment, alias: string, makeDefault = false): void {
-    const next = structuredClone(this.document);
-    const existing = next.environments[environment];
-    next.environments[environment] = existing ?? {
-      datasource_bindings: {},
-      expose_as_explicit_tool: environment !== next.default_environment,
-    };
-    next.environments[environment]!.datasource_bindings[datasource] = alias;
-    if (makeDefault) {
-      next.default_datasource = datasource;
-      next.default_environment = environment;
-    }
-    this.commit(next);
+  async setBinding(
+    datasource: string,
+    environment: ConnectionEnvironment,
+    alias: string,
+    makeDefault = false,
+    options: { requireAbsent?: boolean; expectedAlias?: string } = {},
+  ): Promise<void> {
+    await this.mutate((next) => {
+      const existing = next.environments[environment];
+      const currentAlias = existing?.datasource_bindings[datasource];
+      if (options.requireAbsent && currentAlias !== undefined) {
+        throw new PluginError({
+          category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_CONFLICT',
+          message: `binding ${datasource}/${environment} 已被并发更新，请重试。`, retryable: true, retryAfterMs: 50,
+        });
+      }
+      if (options.expectedAlias !== undefined && currentAlias !== options.expectedAlias) {
+        throw new PluginError({
+          category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_CONFLICT',
+          message: `binding ${datasource}/${environment} 已被并发更新，请重试。`, retryable: true, retryAfterMs: 50,
+        });
+      }
+      next.environments[environment] = existing ?? {
+        datasource_bindings: {},
+        expose_as_explicit_tool: environment !== next.default_environment,
+      };
+      next.environments[environment]!.datasource_bindings[datasource] = alias;
+      if (makeDefault) {
+        next.default_datasource = datasource;
+        next.default_environment = environment;
+      }
+    });
   }
 
-  removeBinding(datasource: string, environment: ConnectionEnvironment): void {
-    const next = structuredClone(this.document);
-    const target = next.environments[environment];
-    if (!target?.datasource_bindings[datasource]) {
-      throw workspaceError('WORKSPACE_BINDING_NOT_FOUND', `找不到 binding ${datasource}/${environment}。`);
-    }
-    if (next.default_datasource === datasource && next.default_environment === environment) {
-      throw workspaceError('WORKSPACE_DEFAULT_BINDING_REMOVE_FORBIDDEN', '不能删除当前默认 binding；请先设置另一个默认目标。');
-    }
-    delete target.datasource_bindings[datasource];
-    this.commit(next);
+  async removeBinding(
+    datasource: string,
+    environment: ConnectionEnvironment,
+    options: { expectedAlias?: string } = {},
+  ): Promise<void> {
+    await this.mutate((next) => {
+      const target = next.environments[environment];
+      if (!target?.datasource_bindings[datasource]) {
+        throw workspaceError('WORKSPACE_BINDING_NOT_FOUND', `找不到 binding ${datasource}/${environment}。`);
+      }
+      if (options.expectedAlias !== undefined && target.datasource_bindings[datasource] !== options.expectedAlias) {
+        throw new PluginError({
+          category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_CONFLICT',
+          message: `binding ${datasource}/${environment} 已被并发更新，请重试。`, retryable: true, retryAfterMs: 50,
+        });
+      }
+      if (next.default_datasource === datasource && next.default_environment === environment) {
+        throw workspaceError('WORKSPACE_DEFAULT_BINDING_REMOVE_FORBIDDEN', '不能删除当前默认 binding；请先设置另一个默认目标。');
+      }
+      delete target.datasource_bindings[datasource];
+    });
   }
 
   references(alias: string): number {
     return this.allBindings().filter((binding) => binding.alias === alias).length;
   }
 
-  private commit(next: WorkspaceDocument): void {
+  private refreshFromDisk(): void {
+    const latest = parseWorkspaceDocument(this.current.descriptorPath);
+    this.acceptLatest(latest);
+  }
+
+  private async mutate(change: (document: WorkspaceDocument) => void): Promise<void> {
+    const release = await acquireDescriptorLock(this.current.descriptorPath);
+    try {
+      const raw = readFileSync(this.current.descriptorPath, 'utf8');
+      const expectedHash = createHash('sha256').update(raw).digest('hex');
+      const latest = parseWorkspaceDocument(this.current.descriptorPath);
+      this.verifyIdentity(latest);
+      const next = structuredClone(latest);
+      change(next);
+      this.commit(next, expectedHash);
+    } finally {
+      release();
+    }
+  }
+
+  private commit(next: WorkspaceDocument, expectedHash: string): void {
     const parsed = workspaceSchema.safeParse(next);
     if (!parsed.success) throw workspaceError('WORKSPACE_SCHEMA_INVALID', '更新后的 workspace 配置无效。', parsed.error);
     const descriptorPath = this.current.descriptorPath;
@@ -262,13 +323,99 @@ export class WorkspaceManager {
       fsyncSync(descriptorHandle);
       closeSync(descriptorHandle);
       descriptorHandle = undefined;
+      const actualHash = createHash('sha256').update(readFileSync(descriptorPath, 'utf8')).digest('hex');
+      if (actualHash !== expectedHash) {
+        throw new PluginError({
+          category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_CONFLICT',
+          message: 'workspace descriptor 在更新期间发生变化，请重试。', retryable: true, retryAfterMs: 50,
+        });
+      }
       renameSync(temporaryPath, descriptorPath);
     } catch (error) {
       if (descriptorHandle !== undefined) closeSync(descriptorHandle);
       try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+      if (error instanceof PluginError && error.code === 'WORKSPACE_DESCRIPTOR_CONFLICT') throw error;
       throw workspaceError('WORKSPACE_WRITE_FAILED', `无法原子更新 workspace descriptor：${descriptorPath}。`, error);
     }
-    this.document = parsed.data;
-    this.current = toContext(descriptorPath, parsed.data);
+    this.acceptLatest(parsed.data);
+  }
+
+  private verifyIdentity(document: WorkspaceDocument): void {
+    const context = toContext(this.current.descriptorPath, document);
+    if (context.workspaceId !== this.identityWorkspaceId || context.rootHash !== this.identityRootHash) {
+      throw new PluginError({
+        category: 'permission_error', code: 'WORKSPACE_IDENTITY_CHANGED',
+        message: 'workspace descriptor 的 workspace_id 或 root 在进程运行期间发生变化，请恢复配置并重新连接。',
+      });
+    }
+  }
+
+  private acceptLatest(document: WorkspaceDocument): void {
+    this.verifyIdentity(document);
+    this.document = document;
+    this.current = toContext(this.current.descriptorPath, document);
+  }
+}
+
+const DESCRIPTOR_LOCK_TIMEOUT_MS = 5_000;
+const DESCRIPTOR_LOCK_STALE_MS = 30_000;
+
+async function acquireDescriptorLock(descriptorPath: string): Promise<() => void> {
+  const lockPath = `${descriptorPath}.lock`;
+  const ownerPath = `${lockPath}/owner.json`;
+  const started = Date.now();
+  while (true) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      const ownerId = randomUUID();
+      try {
+        writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, owner_id: ownerId, created_at: new Date().toISOString() }), {
+          encoding: 'utf8', mode: 0o600, flag: 'wx',
+        });
+      } catch (error) {
+        try { unlinkSync(ownerPath); } catch { /* best effort */ }
+        try { rmdirSync(lockPath); } catch { /* best effort */ }
+        throw error;
+      }
+      return () => {
+        try {
+          const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { owner_id?: unknown };
+          if (owner.owner_id !== ownerId) return;
+          unlinkSync(ownerPath);
+          rmdirSync(lockPath);
+        } catch { /* a crashed owner is recoverable through stale-lock handling */ }
+      };
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error ? String((error as NodeJS.ErrnoException).code) : '';
+      if (code !== 'EEXIST') throw workspaceError('WORKSPACE_LOCK_FAILED', '无法创建 workspace descriptor 文件锁。', error);
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > DESCRIPTOR_LOCK_STALE_MS) {
+          let ownerAlive = false;
+          try {
+            const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: unknown };
+            if (typeof owner.pid === 'number' && Number.isInteger(owner.pid) && owner.pid > 0) {
+              try { process.kill(owner.pid, 0); ownerAlive = true; }
+              catch (probeError) {
+                ownerAlive = (probeError as NodeJS.ErrnoException).code === 'EPERM';
+              }
+            }
+          } catch { /* malformed stale owner is removable */ }
+          if (!ownerAlive) {
+            try { unlinkSync(ownerPath); } catch { /* owner may be absent */ }
+            rmdirSync(lockPath);
+            continue;
+          }
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - started >= DESCRIPTOR_LOCK_TIMEOUT_MS) {
+        throw new PluginError({
+          category: 'config_error', code: 'WORKSPACE_LOCK_TIMEOUT', message: 'workspace descriptor 正被其他进程更新，请稍后重试。',
+          retryable: true, retryAfterMs: 100,
+        });
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
   }
 }

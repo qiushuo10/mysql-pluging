@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadWorkspaceContext, parseRuntimeOptions } from '../src/workspace/context.js';
+import { loadWorkspaceContext, parseRuntimeOptions, WorkspaceManager } from '../src/workspace/context.js';
 
 const roots: string[] = [];
 
@@ -94,6 +94,31 @@ environments:
 business_pack_paths: []
 `);
     expect(() => loadWorkspaceContext(writableProd)).toThrow(/不符合 mysql-agent\/workspace\/1/);
+  });
+
+  it('merges concurrent updates from two managers without losing a binding', async () => {
+    const path = workspaceFile(`
+schema_version: mysql-agent/workspace/1
+workspace_id: concurrent
+label: Concurrent
+runtime_mode: workspace
+default_datasource: app
+default_environment: test
+environments:
+  test: { datasource_bindings: { app: app-test } }
+  staging: { datasource_bindings: {} }
+business_pack_paths: []
+`);
+    const first = new WorkspaceManager(path);
+    const second = new WorkspaceManager(path);
+    await Promise.all([
+      first.setBinding('reporting', 'staging', 'reporting-stage'),
+      second.setBinding('warehouse', 'staging', 'warehouse-stage'),
+    ]);
+    const current = loadWorkspaceContext(path);
+    expect(current.environments.get('staging')?.datasourceBindings).toEqual({
+      reporting: 'reporting-stage', warehouse: 'warehouse-stage',
+    });
   });
 });
 

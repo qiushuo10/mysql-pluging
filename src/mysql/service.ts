@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
 import { DEFAULT_MAX_ROWS, MAX_MAX_ROWS, MAX_RESULT_BYTES } from '../constants.js';
-import { StateStore } from '../config/store.js';
+import { StateStore, type ConnectionIdentity } from '../config/store.js';
 import { PluginError, mapMysqlError, unknownError } from '../errors.js';
 import { compileNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
@@ -27,6 +27,7 @@ export interface QueryRequest {
   workspaceId?: string;
   datasourceId?: string;
   environment?: ConnectionConfig['environment'];
+  expectedConnection?: ConnectionIdentity;
 }
 
 export interface WriteRequest extends Omit<QueryRequest, 'maxRows' | 'retrySafeAfterSend'> {
@@ -94,7 +95,7 @@ export class MysqlService {
     const compiled = compileNamedParameters(request.sql, request.parameters);
     const sqlHash = this.hashSql(compiled.sql);
     try {
-      config = this.requireEnabledConnection(request.connection);
+      config = this.requireEnabledConnection(request.connection, request.expectedConnection);
       const maxRows = request.maxRows ?? DEFAULT_MAX_ROWS;
       if (maxRows < 1 || maxRows > MAX_MAX_ROWS) {
         throw new PluginError({
@@ -176,7 +177,7 @@ export class MysqlService {
     const compiled = compileNamedParameters(request.sql, request.parameters);
     const sqlHash = this.hashSql(compiled.sql);
     try {
-      config = this.requireEnabledConnection(request.connection);
+      config = this.requireEnabledConnection(request.connection, request.expectedConnection);
       if (config.accessMode !== 'read_write') {
         throw new PluginError({
           category: 'permission_error',
@@ -274,8 +275,14 @@ export class MysqlService {
     this.store.close();
   }
 
-  private requireEnabledConnection(alias: string): ConnectionConfig {
-    const config = this.store.requireConnection(alias);
+  private requireEnabledConnection(alias: string, expected?: ConnectionIdentity): ConnectionConfig {
+    if (expected && expected.alias !== alias) {
+      throw new PluginError({
+        category: 'permission_error', code: 'AUTH_TARGET_CHANGED',
+        message: '请求连接与已验证的 workspace 目标不一致。', retryable: true,
+      });
+    }
+    const config = expected ? this.store.assertConnectionIdentity(expected) : this.store.requireConnection(alias);
     if (!config.enabled) {
       throw new PluginError({
         category: 'config_error',

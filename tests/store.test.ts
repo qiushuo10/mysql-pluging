@@ -90,6 +90,26 @@ describe('StateStore', () => {
     store.close();
   });
 
+  it('refuses conditional deletion after the authorized revision changes', () => {
+    const store = createStore();
+    store.addConnection({
+      alias: 'owned-test', datasourceId: 'owned', environment: 'test', ownerScope: 'workspace:one',
+      host: 'localhost', username: 'agent', password: 'secret', database: 'owned',
+    });
+    const original = store.requireConnection('owned-test');
+    const expected = {
+      alias: original.alias, datasourceId: original.datasourceId!, environment: original.environment!,
+      ownerScope: original.ownerScope!, revision: original.revision,
+    };
+    store.updateConnection({ alias: 'owned-test', description: 'changed' });
+    expect(() => store.updateConnection({ alias: 'owned-test', description: 'stale update' }, expected))
+      .toThrow(/AUTH_TARGET_CHANGED|授权目标或 revision/);
+    expect(store.requireConnection('owned-test').description).toBe('changed');
+    expect(() => store.removeConnection('owned-test', expected)).toThrow(/AUTH_TARGET_CHANGED|授权目标或 revision/);
+    expect(store.requireConnection('owned-test').revision).toBe(2);
+    store.close();
+  });
+
   it('requires the default database in the allowed database list', () => {
     const store = createStore();
     expect(() =>
