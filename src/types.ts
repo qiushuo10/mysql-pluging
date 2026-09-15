@@ -135,6 +135,30 @@ export interface UsageSummaryFilters {
   groupBy?: UsageGroupBy;
 }
 
+export interface DiscoveryRecord {
+  workspaceId: string;
+  runId: string | null;
+  traceId: string | null;
+  datasourceId: string;
+  environment: ConnectionEnvironment;
+  occurredAt: string;
+  statementKind: string;
+  sqlFingerprint: string;
+  parameterShape: Record<string, { type: string; list: boolean }>;
+  tableNames: string[];
+  durationMs: number;
+  resultBytes: number;
+  status: 'ok' | 'error';
+}
+
+export interface DiscoveryCandidateFilters {
+  workspaceId: string;
+  since?: string;
+  until?: string;
+  minCount: number;
+  limit: number;
+}
+
 export interface AuditHistoryRecord extends AuditRecord {
   id: number;
 }

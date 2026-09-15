@@ -290,3 +290,14 @@ export const workspaceUsageSummarySchema = z.object({
 }).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
   message: 'since 不能晚于 until', path: ['since'],
 });
+
+export const workspaceBusinessCandidateAnalyzeSchema = z.object({
+  since: auditTimestamp.optional(),
+  until: auditTimestamp.optional(),
+  min_count: z.number().int().min(2).max(1_000_000).default(3),
+  limit: z.number().int().min(1).max(100).default(20),
+}).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
+  message: 'since 不能晚于 until', path: ['since'],
+});
+
+export const workspaceBusinessReloadSchema = z.object({}).strict();

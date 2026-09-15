@@ -4,6 +4,7 @@ import { Buffer } from 'node:buffer';
 import { DEFAULT_MAX_ROWS, MAX_MAX_ROWS, MAX_RESULT_BYTES } from '../constants.js';
 import { StateStore, type ConnectionIdentity } from '../config/store.js';
 import { PluginError, mapMysqlError, unknownError } from '../errors.js';
+import { parameterShape, sqlFingerprint } from '../discovery/fingerprint.js';
 import { compileNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
 import type { ExecutionContext } from '../trace/recorder.js';
@@ -30,6 +31,8 @@ export interface QueryRequest {
   environment?: ConnectionConfig['environment'];
   expectedConnection?: ConnectionIdentity;
   traceContext?: ExecutionContext;
+  /** Set only by workspace generic SQL tools; fixed business operations omit it. */
+  discoveryEnabled?: boolean;
 }
 
 export interface WriteRequest extends Omit<QueryRequest, 'maxRows' | 'retrySafeAfterSend'> {
@@ -94,6 +97,7 @@ export class MysqlService {
     let config: ConnectionConfig | undefined;
     let kind = 'query';
     let attemptCount = 1;
+    let discoveryTables: string[] | undefined;
     const compiled = compileNamedParameters(request.sql, request.parameters);
     const sqlHash = this.hashSql(compiled.sql);
     try {
@@ -108,6 +112,7 @@ export class MysqlService {
       }
       const validation = validateQuerySql(compiled.sql, config.allowedDatabases, maxRows);
       kind = validation.kind;
+      discoveryTables = validation.tables;
       const timeoutMs = this.effectiveTimeout(config, request.timeoutMs);
       const run = await this.runtimes.withRuntime(config, (runtime) =>
         runtime.run(
@@ -163,12 +168,14 @@ export class MysqlService {
         writeOutcome: 'not_applicable',
         status: 'ok',
       });
+      this.recordDiscoveryBestEffort(request, validation.kind, discoveryTables, durationMs, serializedBytes(result), 'ok');
       return result;
     } catch (error) {
       if (config && isSchemaDriftError(error)) this.schema.invalidate(config.alias, config.revision);
       const pluginError = this.mapExecutionError(error, request.connection, false, attemptCount, false, compiled.values);
       const durationMs = Math.round(performance.now() - started);
       this.auditError(executionId, request, config, kind, sqlHash, durationMs, pluginError);
+      if (discoveryTables) this.recordDiscoveryBestEffort(request, kind, discoveryTables, durationMs, 0, 'error');
       throw Object.assign(pluginError, { executionId });
     }
   }
@@ -180,6 +187,7 @@ export class MysqlService {
     let kind: 'insert' | 'update' | 'delete' | 'write' = 'write';
     let attemptCount = 1;
     let writeSent = false;
+    let discoveryTables: string[] | undefined;
     const compiled = compileNamedParameters(request.sql, request.parameters);
     const sqlHash = this.hashSql(compiled.sql);
     try {
@@ -194,6 +202,7 @@ export class MysqlService {
       }
       const validation = validateWriteSql(compiled.sql, config.allowedDatabases);
       kind = validation.kind as 'insert' | 'update' | 'delete';
+      discoveryTables = validation.tables;
       if (request.expectedMode && request.expectedMode !== kind) {
         throw new PluginError({
           category: 'argument_error',
@@ -270,12 +279,14 @@ export class MysqlService {
         writeOutcome: run.value.writeOutcome,
         status: 'ok',
       });
+      this.recordDiscoveryBestEffort(request, kind, discoveryTables, durationMs, serializedBytes(result), 'ok');
       return result;
     } catch (error) {
       if (config && isSchemaDriftError(error)) this.schema.invalidate(config.alias, config.revision);
       const pluginError = this.mapExecutionError(error, request.connection, true, attemptCount, writeSent, compiled.values);
       const durationMs = Math.round(performance.now() - started);
       this.auditError(executionId, request, config, kind, sqlHash, durationMs, pluginError);
+      if (discoveryTables) this.recordDiscoveryBestEffort(request, kind, discoveryTables, durationMs, 0, 'error');
       throw Object.assign(pluginError, { executionId });
     }
   }
@@ -432,6 +443,41 @@ export class MysqlService {
       errorCategory: error.category,
       mysqlErrorCode: error.mysqlCode,
     });
+  }
+
+  private recordDiscoveryBestEffort(
+    request: QueryRequest | WriteRequest,
+    statementKind: string,
+    tables: string[],
+    durationMs: number,
+    resultBytes: number,
+    status: 'ok' | 'error',
+  ): void {
+    if (!request.discoveryEnabled || !request.workspaceId || !request.datasourceId || !request.environment
+      || request.businessOperationId !== undefined) return;
+    try {
+      this.store.recordDiscovery({
+        workspaceId: request.workspaceId,
+        runId: request.traceContext?.runId ?? null,
+        traceId: request.traceContext?.traceId ?? null,
+        datasourceId: request.datasourceId,
+        environment: request.environment,
+        occurredAt: new Date().toISOString(),
+        statementKind,
+        sqlFingerprint: sqlFingerprint(request.sql),
+        parameterShape: parameterShape(request.parameters),
+        tableNames: tables,
+        durationMs,
+        resultBytes,
+        status,
+      });
+    } catch (error) {
+      process.stderr.write(`${JSON.stringify({
+        level: 'warn', event: 'discovery_write_failed',
+        workspace_id: request.workspaceId,
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`);
+    }
   }
 }
 

@@ -121,6 +121,68 @@ async function connect(application: MysqlMcpApplication): Promise<Client> {
 afterEach(() => { for (const value of roots.splice(0)) rmSync(value, { recursive: true, force: true }); });
 
 describe('business pack v2', () => {
+  it('reloads changed logic, dynamically adds/removes tools, and preserves last-known-good on failure', async () => {
+    const state = fixture();
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async (request) => ({
+      schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'query', connection: request.connection,
+      business_operation_id: request.businessOperationId ?? null, sql_marker: request.sql,
+      rows: [], row_count: 0, duration_ms: 1,
+    });
+    const client = await connect(app);
+    writeFileSync(join(state.packs, 'sample', 'sql', 'find.sql'), 'SELECT :id AS changed_id LIMIT 1');
+    const changed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(changed.isError, JSON.stringify(changed)).toBe(false);
+    expect(changed.structuredContent).toEqual(expect.objectContaining({
+      generation: expect.objectContaining({ id: 2 }), reconnect_recommended: false,
+    }));
+    const call = await client.callTool({ name: 'business__order__read', arguments: { operation: 'find', input: { id: 'A1' } } });
+    expect(call.structuredContent).toEqual(expect.objectContaining({ sql_marker: 'SELECT :id AS changed_id LIMIT 1' }));
+
+    const extra = join(state.packs, 'extra');
+    mkdirSync(join(extra, 'sql'), { recursive: true });
+    writeFileSync(join(extra, 'sql', 'health.sql'), 'SELECT 1 AS ok LIMIT 1');
+    writeFileSync(join(extra, 'pack.yml'), `
+schema_version: mysql-agent/business-pack/2
+pack_id: reload-extra
+version: 1.0.0
+operations:
+  - id: health.check
+    kind: sql
+    domain: health
+    name: check
+    title: 健康检查
+    description: 固定健康检查。
+    use_when: 需要检查时。
+    exposure: direct
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input: {}
+    sql_file: sql/health.sql
+    max_rows: 1
+`);
+    const added = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(added.structuredContent).toEqual(expect.objectContaining({ added_tools: 1, reconnect_recommended: true }));
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('business__health__check');
+    rmSync(extra, { recursive: true, force: true });
+    const removed = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(removed.structuredContent).toEqual(expect.objectContaining({ removed_tools: 1, reconnect_recommended: true }));
+    expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain('business__health__check');
+
+    const generationBeforeFailure = app.businessGenerationManager!.snapshot().id;
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), 'const = invalid syntax');
+    const invalid = await client.callTool({ name: 'workspace_business_reload', arguments: {} });
+    expect(invalid.isError).toBe(true);
+    expect(app.businessGenerationManager!.snapshot().id).toBe(generationBeforeFailure);
+    const validation = await client.callTool({ name: 'workspace_validate', arguments: {} });
+    expect(validation.structuredContent).toEqual(expect.objectContaining({
+      business_generation: expect.objectContaining({ id: generationBeforeFailure }),
+      last_business_reload: expect.objectContaining({ status: 'error' }),
+    }));
+    await client.close(); await app.close();
+  });
+
   it('resolves SQL and scripts per environment, keeps public ids stable, and reports disabled targets', () => {
     const state = fixture();
     const loaded = loadBusinessOperations(state.packs, { workspace: loadWorkspaceContext(state.descriptor) });

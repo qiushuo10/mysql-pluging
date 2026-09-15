@@ -24,6 +24,8 @@ import type {
   ConnectionConfig,
   ConnectionEnvironment,
   ConnectionSummary,
+  DiscoveryCandidateFilters,
+  DiscoveryRecord,
   ExecutionRunRecord,
   ExecutionSpanRecord,
   SchemaSnapshotRecord,
@@ -443,6 +445,48 @@ export class StateStore {
           CREATE INDEX IF NOT EXISTS idx_execution_audit_run ON execution_audit(run_id, occurred_at DESC);
         `);
         this.recordMigration(9);
+      }
+      if (current < 10) {
+        this.database.exec(`
+          CREATE TABLE IF NOT EXISTS discovery_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id TEXT NOT NULL,
+            run_id TEXT,
+            trace_id TEXT,
+            datasource_id TEXT NOT NULL,
+            environment TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            statement_kind TEXT NOT NULL,
+            sql_fingerprint TEXT NOT NULL,
+            parameter_shape_json TEXT NOT NULL,
+            table_names_json TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            result_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            previous_fingerprint TEXT,
+            previous_gap_ms INTEGER
+          );
+          CREATE INDEX IF NOT EXISTS idx_discovery_workspace_time
+            ON discovery_events(workspace_id, occurred_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_discovery_workspace_candidate
+            ON discovery_events(workspace_id, datasource_id, environment, statement_kind, sql_fingerprint);
+
+          CREATE TABLE IF NOT EXISTS business_reload_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            content_hash TEXT,
+            error_code TEXT,
+            added_tools INTEGER NOT NULL DEFAULT 0,
+            updated_tools INTEGER NOT NULL DEFAULT 0,
+            removed_tools INTEGER NOT NULL DEFAULT 0,
+            occurred_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_business_reload_workspace_time
+            ON business_reload_events(workspace_id, occurred_at DESC);
+        `);
+        this.recordMigration(10);
       }
       this.database.exec('COMMIT');
     } catch (error) {
@@ -1089,6 +1133,93 @@ export class StateStore {
         resultBytes: items.reduce((sum, item) => sum + Number(item.result_bytes ?? 0), 0),
       };
     });
+  }
+
+  recordDiscovery(record: DiscoveryRecord): void {
+    const previous = this.database.prepare(`SELECT sql_fingerprint, occurred_at FROM discovery_events
+      WHERE workspace_id = ? AND datasource_id = ? AND environment = ?
+      ORDER BY occurred_at DESC, id DESC LIMIT 1`)
+      .get(record.workspaceId, record.datasourceId, record.environment) as { sql_fingerprint: string; occurred_at: string } | undefined;
+    const gap = previous ? Math.max(0, Date.parse(record.occurredAt) - Date.parse(previous.occurred_at)) : null;
+    this.database.prepare(`INSERT INTO discovery_events (
+      workspace_id, run_id, trace_id, datasource_id, environment, occurred_at,
+      statement_kind, sql_fingerprint, parameter_shape_json, table_names_json,
+      duration_ms, result_bytes, status, previous_fingerprint, previous_gap_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        record.workspaceId, record.runId, record.traceId, record.datasourceId, record.environment,
+        record.occurredAt, record.statementKind, record.sqlFingerprint,
+        JSON.stringify(record.parameterShape), JSON.stringify([...new Set(record.tableNames)].sort()),
+        record.durationMs, record.resultBytes, record.status,
+        previous?.sql_fingerprint ?? null, gap,
+      );
+  }
+
+  analyzeDiscoveryCandidates(filters: DiscoveryCandidateFilters): Array<Record<string, unknown>> {
+    const clauses = ['workspace_id = ?'];
+    const values: Array<string | number> = [filters.workspaceId];
+    if (filters.since) { clauses.push('occurred_at >= ?'); values.push(filters.since); }
+    if (filters.until) { clauses.push('occurred_at <= ?'); values.push(filters.until); }
+    const rows = this.database.prepare(`SELECT * FROM discovery_events WHERE ${clauses.join(' AND ')}
+      ORDER BY occurred_at, id`).all(...values) as unknown as Array<Record<string, unknown>>;
+    const groups = new Map<string, Array<Record<string, unknown>>>();
+    for (const row of rows) {
+      const key = [row.datasource_id, row.environment, row.statement_kind, row.sql_fingerprint].join('\u0000');
+      const group = groups.get(key) ?? [];
+      group.push(row);
+      groups.set(key, group);
+    }
+    return [...groups.values()].filter((items) => items.length >= filters.minCount).map((items) => {
+      const sample = items[0]!;
+      const durations = items.map((row) => Number(row.duration_ms)).sort((a, b) => a - b);
+      const repeated = items.filter((row) => row.previous_fingerprint === sample.sql_fingerprint
+        && Number(row.previous_gap_ms ?? Number.MAX_SAFE_INTEGER) <= 300_000).length;
+      const repeatedSequenceScore = Math.round((repeated / Math.max(1, items.length - 1)) * 1000) / 1000;
+      const estimatedCallsSaved = Math.max(0, items.length - 1);
+      const errorCount = items.filter((row) => row.status === 'error').length;
+      const score = Math.round((Math.log2(items.length + 1) * 10 + repeatedSequenceScore * 20
+        + Math.min(20, percentile(durations, 0.95) / 500) - errorCount / items.length * 10) * 100) / 100;
+      const resultBytes = items.map((row) => Number(row.result_bytes ?? 0));
+      return {
+        datasource_id: String(sample.datasource_id), environment: String(sample.environment),
+        statement_kind: String(sample.statement_kind), sql_fingerprint: String(sample.sql_fingerprint),
+        count: items.length, error_count: errorCount,
+        p50_ms: percentile(durations, 0.5), p95_ms: percentile(durations, 0.95),
+        avg_ms: Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length * 100) / 100,
+        avg_result_bytes: Math.round(resultBytes.reduce((sum, value) => sum + value, 0) / resultBytes.length * 100) / 100,
+        repeated_sequence_score: repeatedSequenceScore,
+        estimated_mcp_calls_saved: estimatedCallsSaved, score,
+        table_names: parseStringArray(sample.table_names_json),
+        parameter_shape: JSON.parse(String(sample.parameter_shape_json)) as unknown,
+      };
+    }).sort((left, right) => Number(right.score) - Number(left.score)
+      || Number(right.count) - Number(left.count))
+      .slice(0, filters.limit);
+  }
+
+  cleanupDiscovery(workspaceId: string, before: string): number {
+    return Number(this.database.prepare('DELETE FROM discovery_events WHERE workspace_id = ? AND occurred_at < ?')
+      .run(workspaceId, before).changes);
+  }
+
+  recordBusinessReload(input: {
+    workspaceId: string; generation: number; status: 'ok' | 'error'; contentHash?: string | null;
+    errorCode?: string | null; addedTools?: number; updatedTools?: number; removedTools?: number; occurredAt?: string;
+  }): void {
+    this.database.prepare(`INSERT INTO business_reload_events (
+      workspace_id, generation, status, content_hash, error_code, added_tools,
+      updated_tools, removed_tools, occurred_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.workspaceId, input.generation, input.status, input.contentHash ?? null,
+        input.errorCode ?? null, input.addedTools ?? 0, input.updatedTools ?? 0,
+        input.removedTools ?? 0, input.occurredAt ?? new Date().toISOString());
+  }
+
+  latestBusinessReload(workspaceId: string): Record<string, unknown> | null {
+    const row = this.database.prepare(`SELECT generation, status, content_hash, error_code,
+      added_tools, updated_tools, removed_tools, occurred_at FROM business_reload_events
+      WHERE workspace_id = ? ORDER BY id DESC LIMIT 1`).get(workspaceId) as Record<string, unknown> | undefined;
+    return row ?? null;
   }
 
   /** Detailed export is intentionally deferred; callers must export and verify before invoking retention cleanup. */

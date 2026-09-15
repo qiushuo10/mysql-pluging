@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import { validateToolName } from '@modelcontextprotocol/sdk/shared/toolNameValidation.js';
 import { z } from 'zod';
@@ -9,6 +9,8 @@ import { z } from 'zod';
 import type { BusinessOperation } from '../business-queries/definition.js';
 import type { DisabledBusinessOperation } from '../business-packs/loader.js';
 import { BusinessOperationRegistry } from '../business-queries/registry.js';
+import { RegistryGenerationManager } from '../business-queries/generation.js';
+import { loadBusinessOperationsFromHomes } from '../business-packs/loader.js';
 import type { AddConnectionInput, ConnectionIdentity, StateStore } from '../config/store.js';
 import { PluginError, unknownError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
@@ -31,6 +33,8 @@ import {
   workspaceValidateSchema,
   workspaceTraceSearchSchema,
   workspaceUsageSummarySchema,
+  workspaceBusinessCandidateAnalyzeSchema,
+  workspaceBusinessReloadSchema,
 } from './schemas.js';
 
 interface WorkspaceTarget {
@@ -297,6 +301,130 @@ function matchingOperations(registry: BusinessOperationRegistry, store: StateSto
     .filter((operation) => operation.mode === 'read' || (target.policy.accessMode === 'read_write' && connection.accessMode === 'read_write'));
 }
 
+interface WorkspaceBusinessDescriptor {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: z.ZodType;
+  annotations: ToolAnnotations;
+  target: WorkspaceTarget;
+  operations: BusinessOperation[];
+}
+
+function workspaceBusinessDescriptors(
+  registry: BusinessOperationRegistry,
+  store: StateStore,
+  targets: WorkspaceTarget[],
+): Map<string, WorkspaceBusinessDescriptor> {
+  const visible: Array<{ target: WorkspaceTarget; operation: BusinessOperation }> = [];
+  for (const target of targets) for (const operation of matchingOperations(registry, store, target)) visible.push({ target, operation });
+  const descriptors = new Map<string, WorkspaceBusinessDescriptor>();
+  for (const { target, operation } of visible.filter((item) => item.operation.exposure === 'direct')) {
+    const name = `business__${businessPrefix(target)}${operation.domain}__${operation.name}`;
+    descriptors.set(name, {
+      name, title: operation.title,
+      description: `${operation.description} 目标由工作空间固定为 ${target.datasourceId}/${target.environment}。`,
+      inputSchema: operation.input, annotations: annotations(operation), target, operations: [operation],
+    });
+  }
+  const groups = new Map<string, Array<{ target: WorkspaceTarget; operation: BusinessOperation }>>();
+  for (const item of visible.filter(({ operation }) => operation.exposure === 'domain')) {
+    const lane = item.operation.mode === 'read' ? 'read' : 'write';
+    const name = `business__${businessPrefix(item.target)}${item.operation.domain}__${lane}`;
+    const group = groups.get(name) ?? [];
+    group.push(item); groups.set(name, group);
+  }
+  for (const [name, group] of groups) {
+    const operationNames = group.map(({ operation }) => operation.name);
+    if (new Set(operationNames).size !== operationNames.length) {
+      throw configError('WORKSPACE_BUSINESS_DISCRIMINATOR_COLLISION', `工具 ${name} 的 operation 名称冲突。`);
+    }
+    const schemas = group.map(({ operation }) => operation.input);
+    const selectedInput = schemas.length === 1 ? schemas[0]! : z.union(schemas as [z.ZodObject, z.ZodObject, ...z.ZodObject[]]);
+    const lane = group[0]!.operation.mode === 'read' ? 'read' : 'write';
+    descriptors.set(name, {
+      name, title: `${group[0]!.operation.domain} ${lane === 'read' ? '查询' : '写入'}操作`,
+      description: '固定业务操作；数据源和环境由工作空间 binding 注入。',
+      inputSchema: z.object({ operation: z.enum(operationNames as [string, ...string[]]), input: selectedInput }).strict(),
+      annotations: { readOnlyHint: lane === 'read', destructiveHint: lane === 'write', idempotentHint: lane === 'read', openWorldHint: true },
+      target: group[0]!.target, operations: group.map(({ operation }) => operation),
+    });
+  }
+  return descriptors;
+}
+
+function workspaceBusinessSurface(
+  registry: BusinessOperationRegistry,
+  store: StateStore,
+  targets: WorkspaceTarget[],
+): Map<string, string> {
+  return new Map([...workspaceBusinessDescriptors(registry, store, targets)].map(([name, descriptor]) => [
+    name, JSON.stringify(z.toJSONSchema(descriptor.inputSchema)),
+  ]));
+}
+
+function registerDynamicBusinessTool(input: {
+  server: McpServer;
+  descriptor: WorkspaceBusinessDescriptor;
+  generations: RegistryGenerationManager;
+  manager: WorkspaceManager;
+  store: StateStore;
+  service: MysqlService;
+  getClientName: () => string;
+  recorder: TraceRecorder;
+}): RegisteredTool {
+  const { descriptor } = input;
+  return input.server.registerTool(descriptor.name, {
+    title: descriptor.title, description: descriptor.description,
+    inputSchema: descriptor.inputSchema,
+    annotations: descriptor.annotations,
+  }, async (args, extra) => {
+    const lease = input.generations.acquire();
+    try {
+      const targets = workspaceTargets(input.manager, input.store);
+      const current = workspaceBusinessDescriptors(lease.registry, input.store, targets).get(descriptor.name);
+      if (!current) return failed(configError('BUSINESS_OPERATION_REMOVED', `业务工具 ${descriptor.name} 已移除。`));
+      const parsed = current.inputSchema.parse(args) as Record<string, unknown>;
+      const operationName = current.operations.length === 1 && current.operations[0]!.exposure === 'direct'
+        ? current.operations[0]!.name
+        : String(parsed.operation ?? '');
+      const operation = current.operations.find((candidate) => candidate.name === operationName);
+      if (!operation) return failed(configError('BUSINESS_OPERATION_NOT_FOUND', `工具 ${descriptor.name} 不包含 ${operationName}。`));
+      const operationInput = operation.exposure === 'direct' ? parsed : parsed.input;
+      const target = targets.find((candidate) => candidate.datasourceId === current.target.datasourceId
+        && candidate.environment === current.target.environment);
+      if (!target || target.alias !== operation.connection) {
+        return failed(configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更，无法安全解析业务操作。'));
+      }
+      return await tracedSafe(input.recorder, {
+        workspaceId: input.manager.context.workspaceId,
+        operationId: publicOperationId(operation, target), operationKind: operation.kind,
+        datasourceIds: operation.kind === 'script' ? [...operation.datasourceIds] : [target.datasourceId],
+        environment: target.environment,
+        connectionAliases: operation.kind === 'script' ? Object.values(operation.connectionBindings) : [target.alias],
+        packId: operation.packId, packVersion: operation.packVersion,
+        operationHash: operation.operationHash, scriptHash: operation.scriptHash,
+      }, async (traceContext) => {
+        const value = await lease.registry.execute(operation, operationInput, input.service, extra.signal, input.getClientName(), {
+          workspaceId: input.manager.context.workspaceId, datasourceId: target.datasourceId,
+          environment: target.environment, expectedConnection: target.identity,
+          publicOperationId: publicOperationId(operation, target), traceContext,
+          traceRecorder: input.recorder,
+          resolveConnection: (datasourceId) => {
+            const expected = targets.find((candidate) => candidate.datasourceId === datasourceId
+              && candidate.environment === target.environment)?.identity;
+            if (!expected) throw configError('BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', `脚本数据源 ${datasourceId}/${target.environment} 无法唯一解析。`);
+            return resolveWorkspaceConnection(input.manager, input.store, datasourceId, target.environment, expected);
+          },
+        });
+        return result('business_operation', publicBusinessResult(value, operation, target));
+      });
+    } finally {
+      lease.release();
+    }
+  });
+}
+
 function registerBoundDataTools(
   server: McpServer,
   names: Set<string>,
@@ -326,6 +454,7 @@ function registerBoundDataTools(
       timeoutMs: args.timeout_ms, requestSignal: extra.signal, clientName: getClientName(),
       workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
       expectedConnection: target.identity, traceContext,
+      discoveryEnabled: manager.context.discovery.enabled,
     });
     return result('query', publicWorkspaceResult(value, target));
   }));
@@ -389,6 +518,7 @@ function registerBoundDataTools(
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
         expectedConnection: target.identity,
         traceContext,
+        discoveryEnabled: manager.context.discovery.enabled,
       });
       return result('execute', publicWorkspaceResult(value, target));
     }));
@@ -405,6 +535,8 @@ function registerWorkspaceBusinessTools(
   targets: WorkspaceTarget[],
   getClientName: () => string,
   recorder: TraceRecorder,
+  generations: RegistryGenerationManager,
+  handles: Map<string, RegisteredTool>,
 ): void {
   const visible: Array<{ target: WorkspaceTarget; operation: BusinessOperation }> = [];
   for (const target of targets) {
@@ -415,26 +547,30 @@ function registerWorkspaceBusinessTools(
     const prefix = businessPrefix(item.target);
     const toolName = `business__${prefix}${item.operation.domain}__${item.operation.name}`;
     registerName(names, toolName);
-    server.registerTool(toolName, {
+    const handle = server.registerTool(toolName, {
       title: item.operation.title,
       description: `${item.operation.description} 目标由工作空间固定为 ${item.target.datasourceId}/${item.target.environment}。`,
       inputSchema: item.operation.input,
       annotations: annotations(item.operation),
-    }, (args, extra) => tracedSafe(recorder, {
-      workspaceId: manager.context.workspaceId, operationId: publicOperationId(item.operation, item.target), operationKind: item.operation.kind,
-      datasourceIds: item.operation.kind === 'script' ? [...item.operation.datasourceIds] : [item.target.datasourceId],
+    }, async (args, extra) => {
+      const lease = generations.acquire();
+      const operation = lease.registry.operation(item.operation.registrationId);
+      if (!operation) { lease.release(); return failed(configError('BUSINESS_OPERATION_REMOVED', `业务操作 ${item.operation.id} 已移除。`)); }
+      try { return await tracedSafe(recorder, {
+      workspaceId: manager.context.workspaceId, operationId: publicOperationId(operation, item.target), operationKind: operation.kind,
+      datasourceIds: operation.kind === 'script' ? [...operation.datasourceIds] : [item.target.datasourceId],
       environment: item.target.environment,
-      connectionAliases: item.operation.kind === 'script' ? Object.values(item.operation.connectionBindings) : [item.target.alias],
-      packId: item.operation.packId, packVersion: item.operation.packVersion, operationHash: item.operation.operationHash,
-      scriptHash: item.operation.scriptHash,
+      connectionAliases: operation.kind === 'script' ? Object.values(operation.connectionBindings) : [item.target.alias],
+      packId: operation.packId, packVersion: operation.packVersion, operationHash: operation.operationHash,
+      scriptHash: operation.scriptHash,
     }, async (traceContext) => {
       const target = liveTarget(manager, store, item.target);
-      if (target.alias !== item.operation.connection) {
+      if (target.alias !== operation.connection) {
         throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
       }
-      const value = await registry.execute(item.operation, args, service, extra.signal, getClientName(), {
+      const value = await lease.registry.execute(operation, args, service, extra.signal, getClientName(), {
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
-        expectedConnection: target.identity, publicOperationId: publicOperationId(item.operation, target),
+        expectedConnection: target.identity, publicOperationId: publicOperationId(operation, target),
         traceContext, traceRecorder: recorder,
         resolveConnection: (datasourceId) => {
           const expected = targets.find((candidate) => candidate.datasourceId === datasourceId && candidate.environment === target.environment)?.identity;
@@ -442,8 +578,10 @@ function registerWorkspaceBusinessTools(
           return resolveWorkspaceConnection(manager, store, datasourceId, target.environment, expected);
         },
       });
-      return result('business_operation', publicBusinessResult(value, item.operation, target));
-    }));
+      return result('business_operation', publicBusinessResult(value, operation, target));
+    }); } finally { lease.release(); }
+    });
+    handles.set(toolName, handle);
   }
 
   const groups = new Map<string, Array<{ target: WorkspaceTarget; operation: BusinessOperation }>>();
@@ -466,30 +604,33 @@ function registerWorkspaceBusinessTools(
     const schemas = group.map(({ operation }) => operation.input);
     const selectedInput = schemas.length === 1 ? schemas[0]! : z.union(schemas as [z.ZodObject, z.ZodObject, ...z.ZodObject[]]);
     const inputSchema = z.object({ operation: z.enum(enumNames), input: selectedInput }).strict();
-    server.registerTool(toolName, {
+    const handle = server.registerTool(toolName, {
       title: `${qualifiedDomain} ${lane === 'read' ? '查询' : '写入'}操作`,
       description: '固定业务操作；数据源和环境由工作空间 binding 注入。', inputSchema,
       annotations: { readOnlyHint: lane === 'read', destructiveHint: lane === 'write', idempotentHint: lane === 'read', openWorldHint: true },
-    }, (args, extra) => {
+    }, async (args, extra) => {
       const operationName = String((args as { operation?: unknown }).operation ?? '');
       const selected = group.find(({ operation }) => operation.name === operationName);
       if (!selected) return safe(() => { throw configError('BUSINESS_OPERATION_NOT_FOUND', `工具 ${toolName} 不包含 ${operationName}。`); });
-      return tracedSafe(recorder, {
-        workspaceId: manager.context.workspaceId, operationId: publicOperationId(selected.operation, selected.target), operationKind: selected.operation.kind,
-        datasourceIds: selected.operation.kind === 'script' ? [...selected.operation.datasourceIds] : [selected.target.datasourceId],
+      const lease = generations.acquire();
+      const operation = lease.registry.operation(selected.operation.registrationId);
+      if (!operation) { lease.release(); return failed(configError('BUSINESS_OPERATION_REMOVED', `业务操作 ${selected.operation.id} 已移除。`)); }
+      try { return await tracedSafe(recorder, {
+        workspaceId: manager.context.workspaceId, operationId: publicOperationId(operation, selected.target), operationKind: operation.kind,
+        datasourceIds: operation.kind === 'script' ? [...operation.datasourceIds] : [selected.target.datasourceId],
         environment: selected.target.environment,
-        connectionAliases: selected.operation.kind === 'script' ? Object.values(selected.operation.connectionBindings) : [selected.target.alias],
-        packId: selected.operation.packId, packVersion: selected.operation.packVersion, operationHash: selected.operation.operationHash,
-        scriptHash: selected.operation.scriptHash,
+        connectionAliases: operation.kind === 'script' ? Object.values(operation.connectionBindings) : [selected.target.alias],
+        packId: operation.packId, packVersion: operation.packVersion, operationHash: operation.operationHash,
+        scriptHash: operation.scriptHash,
       }, async (traceContext) => {
         const parsed = inputSchema.parse(args) as { operation: string; input: unknown };
         const target = liveTarget(manager, store, selected.target);
-        if (target.alias !== selected.operation.connection) {
+        if (target.alias !== operation.connection) {
           throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
         }
-        const value = await registry.execute(selected.operation, parsed.input, service, extra.signal, getClientName(), {
+        const value = await lease.registry.execute(operation, parsed.input, service, extra.signal, getClientName(), {
           workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
-          expectedConnection: target.identity, publicOperationId: publicOperationId(selected.operation, target), traceContext,
+          expectedConnection: target.identity, publicOperationId: publicOperationId(operation, target), traceContext,
           traceRecorder: recorder,
           resolveConnection: (datasourceId) => {
             const expected = targets.find((candidate) => candidate.datasourceId === datasourceId && candidate.environment === target.environment)?.identity;
@@ -497,9 +638,11 @@ function registerWorkspaceBusinessTools(
             return resolveWorkspaceConnection(manager, store, datasourceId, target.environment, expected);
           },
         });
-        return result('business_operation', publicBusinessResult(value, selected.operation, target));
+        return result('business_operation', publicBusinessResult(value, operation, target));
       });
+      } finally { lease.release(); }
     });
+    handles.set(toolName, handle);
   }
 
   registerName(names, 'list_business_operations');
@@ -508,8 +651,12 @@ function registerWorkspaceBusinessTools(
     inputSchema: workspaceListBusinessOperationsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, (args) => safe(async () => {
+    const lease = generations.acquire();
+    try {
+    const currentVisible: Array<{ target: WorkspaceTarget; operation: BusinessOperation }> = [];
+    for (const target of targets) for (const operation of matchingOperations(lease.registry, store, target)) currentVisible.push({ target, operation });
     const keyword = args.keyword?.toLowerCase();
-    const operations = visible
+    const operations = currentVisible
       .filter(({ operation }) => !args.domain || operation.domain === args.domain)
       .filter(({ operation }) => !args.mode || operation.mode === args.mode)
       .filter(({ operation }) => !keyword || [operation.id, operation.title, operation.description, operation.useWhen].join(' ').toLowerCase().includes(keyword))
@@ -523,7 +670,8 @@ function registerWorkspaceBusinessTools(
         input_schema: z.toJSONSchema(operation.input), business_pack_id: operation.packId ?? null,
         business_pack_version: operation.packVersion ?? null, business_operation_hash: operation.operationHash ?? null,
       }));
-    return result('business_operation_list', { operations });
+    return result('business_operation_list', { operations, generation: lease.generation });
+    } finally { lease.release(); }
   }));
 }
 
@@ -566,7 +714,11 @@ function registerWorkspaceManagementTools(
   manager: WorkspaceManager,
   store: StateStore,
   service: MysqlService,
-  disabledOperations: readonly DisabledBusinessOperation[],
+  disabledState: { value: readonly DisabledBusinessOperation[] },
+  generations: RegistryGenerationManager,
+  businessHandles: Map<string, RegisteredTool>,
+  getClientName: () => string,
+  recorder: TraceRecorder,
 ): void {
   const addTool = (name: string) => registerName(names, name);
   addTool('workspace_datasource_add');
@@ -737,8 +889,85 @@ function registerWorkspaceManagementTools(
     return result('workspace_validate', {
       workspace_id: manager.context.workspaceId, valid: true, binding_count: manager.allBindings().length,
       exposed_target_count: targets.length, root_hash: manager.context.rootHash,
-      disabled_business_operations: disabledOperations,
+      disabled_business_operations: disabledState.value,
+      business_generation: generations.snapshot(),
+      last_business_reload: store.latestBusinessReload(manager.context.workspaceId),
     });
+  }));
+
+  addTool('workspace_business_reload');
+  server.registerTool('workspace_business_reload', {
+    title: '重新加载工作空间业务包',
+    description: '重新读取并完整校验 business_pack_paths；仅在全部成功后原子切换到新 generation。失败保留上一版本。',
+    inputSchema: workspaceBusinessReloadSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, () => safe(async () => {
+    const candidateHolder: { value?: BusinessOperationRegistry } = {};
+    try {
+      let oldSurface = new Map<string, string>();
+      const swapped = await generations.serializedReload(async () => {
+        const oldLease = generations.acquire();
+        try { oldSurface = workspaceBusinessSurface(oldLease.registry, store, workspaceTargets(manager, store)); }
+        finally { oldLease.release(); }
+        const loaded = loadBusinessOperationsFromHomes(manager.context.businessPackPaths, { workspace: manager.context });
+        const candidate = new BusinessOperationRegistry(loaded.operations);
+        candidateHolder.value = candidate;
+        await candidate.validateScripts();
+        const nextSurface = workspaceBusinessSurface(candidate, store, workspaceTargets(manager, store));
+        for (const [name, signature] of nextSurface) {
+          const previous = oldSurface.get(name);
+          if (previous !== undefined && previous !== signature) {
+            throw configError('BUSINESS_TOOL_SCHEMA_CHANGED', `工具 ${name} 的输入 schema 发生变化；为避免客户端缓存误解析，本次未切换。`);
+          }
+        }
+        return { registry: candidate, value: { loaded, nextSurface } };
+      });
+      delete candidateHolder.value;
+      const nextSurface = swapped.value.nextSurface;
+      const added = [...nextSurface.keys()].filter((name) => !oldSurface.has(name)).length;
+      const removed = [...oldSurface.keys()].filter((name) => !nextSurface.has(name)).length;
+      const updated = [...nextSurface.keys()].filter((name) => oldSurface.has(name)).length;
+      const currentLease = generations.acquire();
+      let descriptors: Map<string, WorkspaceBusinessDescriptor>;
+      try {
+        descriptors = workspaceBusinessDescriptors(currentLease.registry, store, workspaceTargets(manager, store));
+      } finally {
+        currentLease.release();
+      }
+      for (const name of [...businessHandles.keys()]) {
+        businessHandles.get(name)!.remove();
+        businessHandles.delete(name);
+        names.delete(name);
+      }
+      for (const [name, descriptor] of descriptors) {
+        registerName(names, name);
+        businessHandles.set(name, registerDynamicBusinessTool({
+          server, descriptor, generations, manager, store, service, getClientName, recorder,
+        }));
+      }
+      disabledState.value = swapped.value.loaded.disabledOperations;
+      store.recordBusinessReload({
+        workspaceId: manager.context.workspaceId, generation: swapped.current.id, status: 'ok',
+        contentHash: swapped.current.hash, addedTools: added, updatedTools: updated, removedTools: removed,
+      });
+      if (added > 0 || removed > 0) server.sendToolListChanged();
+      return result('workspace_business_reload', {
+        generation: swapped.current, previous_generation: swapped.previous,
+        added_tools: added, updated_tools: updated, removed_tools: removed,
+        disabled_business_operations: swapped.value.loaded.disabledOperations,
+        reconnect_recommended: added > 0 || removed > 0,
+      });
+    } catch (error) {
+      if (candidateHolder.value) await candidateHolder.value.close();
+      const normalized = unknownError(error);
+      try {
+        store.recordBusinessReload({
+          workspaceId: manager.context.workspaceId, generation: generations.snapshot().id,
+          status: 'error', contentHash: generations.snapshot().hash, errorCode: normalized.code,
+        });
+      } catch { /* reload outcome remains authoritative even if telemetry is unavailable */ }
+      throw error;
+    }
   }));
 }
 
@@ -748,16 +977,23 @@ export function registerWorkspaceTools(input: {
   store: StateStore;
   service: MysqlService;
   registry: BusinessOperationRegistry;
+  generationManager: RegistryGenerationManager;
   getClientName: () => string;
   recorder?: TraceRecorder;
   disabledOperations?: readonly DisabledBusinessOperation[];
 }): void {
   const names = new Set<string>();
+  const businessHandles = new Map<string, RegisteredTool>();
+  const disabledState: { value: readonly DisabledBusinessOperation[] } = { value: input.disabledOperations ?? [] };
   const recorder = input.recorder ?? new TraceRecorder(input.store);
   const staleBefore = new Date(Date.now() - 60 * 60_000).toISOString();
   input.store.reconcileStaleExecutionRuns(input.manager.context.workspaceId, staleBefore);
   const retentionBefore = new Date(Date.now() - input.manager.context.auditRetentionDays * 86_400_000).toISOString();
   input.store.cleanupExecutionTraces(input.manager.context.workspaceId, retentionBefore);
+  if (input.manager.context.discovery.enabled) {
+    const discoveryBefore = new Date(Date.now() - input.manager.context.discovery.retentionDays * 86_400_000).toISOString();
+    input.store.cleanupDiscovery(input.manager.context.workspaceId, discoveryBefore);
+  }
   const targets = workspaceTargets(input.manager, input.store);
   for (const target of targets) registerBoundDataTools(input.server, names, input.manager, input.store, input.service, target, input.getClientName, recorder);
 
@@ -845,6 +1081,33 @@ export function registerWorkspaceTools(input: {
     return result('usage_summary', { group_by: args.group_by ?? null, groups });
   }));
 
-  registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName, recorder);
-  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service, input.disabledOperations ?? []);
+  registerName(names, 'business_candidate_analyze');
+  input.server.registerTool('business_candidate_analyze', {
+    title: '分析候选业务工具',
+    description: '聚合当前工作空间显式开启的通用 SQL discovery 指纹；不返回 SQL、参数值或物理连接 alias。',
+    inputSchema: workspaceBusinessCandidateAnalyzeSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, (args) => safe(() => {
+    if (!input.manager.context.discovery.enabled) {
+      throw configError('WORKSPACE_DISCOVERY_DISABLED', '当前工作空间未开启 discovery。');
+    }
+    const discoveryBefore = new Date(Date.now() - input.manager.context.discovery.retentionDays * 86_400_000).toISOString();
+    input.store.cleanupDiscovery(input.manager.context.workspaceId, discoveryBefore);
+    const candidates = input.store.analyzeDiscoveryCandidates({
+      workspaceId: input.manager.context.workspaceId,
+      since: args.since ? new Date(args.since).toISOString() : undefined,
+      until: args.until ? new Date(args.until).toISOString() : undefined,
+      minCount: args.min_count,
+      limit: args.limit,
+    });
+    const publishedUsage = (['sql', 'script'] as const).flatMap((operationKind) => input.store.usageSummary({
+      workspaceId: input.manager.context.workspaceId, operationKind, groupBy: 'operation',
+      since: args.since ? new Date(args.since).toISOString() : undefined,
+      until: args.until ? new Date(args.until).toISOString() : undefined,
+    }).map((group) => ({ operation_id: group.group, operation_kind: operationKind, count: group.count, error_count: group.errorCount })));
+    return result('business_candidate_analysis', { candidates, published_usage: publishedUsage });
+  }));
+
+  registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName, recorder, input.generationManager, businessHandles);
+  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service, disabledState, input.generationManager, businessHandles, input.getClientName, recorder);
 }

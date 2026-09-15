@@ -5,6 +5,7 @@ import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/
 import { z } from 'zod';
 
 import { BusinessOperationRegistry, businessDirectToolName } from '../business-queries/registry.js';
+import { RegistryGenerationManager } from '../business-queries/generation.js';
 import type { BusinessOperation } from '../business-queries/definition.js';
 import {
   loadBusinessOperations,
@@ -529,6 +530,7 @@ export interface MysqlMcpApplication {
   mode: RuntimeMode;
   workspaceManager: WorkspaceManager | null;
   traceRecorder: TraceRecorder;
+  businessGenerationManager: RegistryGenerationManager | null;
   close(): Promise<void>;
 }
 
@@ -561,6 +563,7 @@ export function createMysqlMcpApplication(options: {
         ? { operations: [] as readonly BusinessOperation[], packs: [] as const, disabledOperations: [] as const, home: null }
         : loadBusinessOperations(options.businessPacksHome);
   const businessRegistry = new BusinessOperationRegistry(loaded.operations);
+  const businessGenerationManager = workspaceManager ? new RegistryGenerationManager(businessRegistry) : null;
   const store = new StateStore(options.stateHome);
   if (workspaceManager) {
     try {
@@ -574,7 +577,7 @@ export function createMysqlMcpApplication(options: {
   const traceRecorder = new TraceRecorder(store);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
   if (workspaceManager) {
-    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations });
+    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, generationManager: businessGenerationManager!, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations });
   } else {
     registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
     if (mode === 'global') registerBusinessTools(server, service, businessRegistry);
@@ -590,6 +593,7 @@ export function createMysqlMcpApplication(options: {
     mode,
     workspaceManager,
     traceRecorder,
-    close: async () => { await businessRegistry.close(); await service.close(); },
+    businessGenerationManager,
+    close: async () => { if (businessGenerationManager) await businessGenerationManager.close(); else await businessRegistry.close(); await service.close(); },
   };
 }

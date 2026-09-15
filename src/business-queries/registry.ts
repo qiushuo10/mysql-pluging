@@ -7,6 +7,7 @@ import type { MysqlService } from '../mysql/service.js';
 import type { ConnectionIdentity } from '../config/store.js';
 import type { BusinessScriptRuntime } from '../business-scripts/runtime.js';
 import { RunBusinessScriptRuntime } from '../business-scripts/runtime.js';
+import { validateBusinessScriptSyntax } from '../business-scripts/syntax.js';
 import { compileNamedParameters, discoverNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
 import { TraceRecorder, type ExecutionContext } from '../trace/recorder.js';
@@ -171,6 +172,23 @@ export class BusinessOperationRegistry {
 
   all(): readonly BusinessOperation[] {
     return this.operations;
+  }
+
+  operation(registrationId: string): BusinessOperation | undefined {
+    return this.byId.get(registrationId);
+  }
+
+  async validateScripts(): Promise<void> {
+    for (const operation of this.operations) {
+      if (operation.kind !== 'script') continue;
+      await this.scriptRuntime.validate({
+        id: operation.id,
+        source: operation.script!,
+        timeoutMs: operation.timeoutMs ?? 10_000,
+        maxResultBytes: operation.maxResultBytes ?? 262_144,
+      });
+      await validateBusinessScriptSyntax(operation.id, operation.script!);
+    }
   }
 
   async close(): Promise<void> {

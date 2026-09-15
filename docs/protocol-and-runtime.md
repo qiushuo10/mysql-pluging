@@ -320,6 +320,12 @@ Registry 启动时要求每个 SQL 占位符对应一个必填属性：普通占
 
 `workspace` 模式下，`sql_query*`、`sql_execute*`、`schema_search*`、`schema_describe*` 和固定 SQL 业务工具每次调用创建一条 `execution_runs` 根记录和一条 root span。成功和错误结果都返回 `trace_id` 与 UUIDv7 `run_id`。真实 SQL 的 `execution_audit` 继承当前 `run_id`、`trace_id` 和 `span_id`；后续脚本内部调用使用 `TraceRecorder.startChild()` 继承同一个 trace，不创建第二条 root。
 
+### Discovery 与业务包重载
+
+工作空间可显式配置 `discovery.enabled: true` 和 1 至 90 天的 `retention_days`。默认关闭。开启后只有该工作空间的通用 `sql_query*` / `sql_execute*` 进入候选采样；固定业务 SQL 和脚本继续由 usage 统计，不重复进入 discovery。采样只保存工作空间、逻辑数据源、环境、语句类型、经过注释和字面量消除后的 SHA-256 指纹、参数名称/类型/列表形状、解析器已验证的表名、耗时、结果字节数、状态和相邻序列提示。它不保存 SQL/归一化模板、参数值、结果、物理 alias 或凭据。`business_candidate_analyze` 强制限定当前工作空间，返回聚合候选及已发布 SQL/script usage 对照。
+
+`workspace_business_reload` 是显式、安全的业务包热重载入口。它串行重新读取当前 `business_pack_paths`，在独立 registry 中完成 YAML、路径、SQL、依赖、工具名、输入 schema 和 QuickJS 语法校验；只有全部成功才切换 generation。业务调用先 acquire generation，完成后 release，因此在途请求可继续使用旧 registry，旧 generation 在引用归零后关闭。工具新增/删除通过 MCP 注册句柄同步并发出 list-changed；同名输入 schema 变化会拒绝本次重载，避免客户端按旧 schema 调用。重载失败保留 last-known-good，`workspace_validate` 返回当前 generation 和最近一次脱敏重载事件。
+
 Trace 根记录创建失败不会阻断业务 handler。此时结果明确返回 `telemetry_persisted: false`、`trace_id: null` 和 `run_id: null`，不会伪造一个未落库的 Trace。Trace 结束更新对 SQLite busy/locked 做最多三次即时有界重试；最终失败只写脱敏告警并返回原业务结果，同时把 `telemetry_persisted` 标记为 `false`。
 
 `trace_search` 只检索当前 descriptor 的 `workspace_id`，支持按 trace、run、operation、kind、status、逻辑数据源、环境和时间过滤。返回 root 与 child span 摘要，但不返回物理连接 alias。`usage_summary` 在同一隔离边界内统计 count、error_count、p50/p95/p99、平均耗时和结果字节数，可按 operation、kind、datasource、environment 或 status 分组。

@@ -47,6 +47,10 @@ const workspaceSchema = z.object({
   environments: z.partialRecord(environmentName, environmentSchema),
   business_pack_paths: z.array(z.string().min(1).max(1_024)).max(32).default([]),
   audit_retention_days: z.number().int().min(1).max(3_650).default(30),
+  discovery: z.object({
+    enabled: z.boolean().default(false),
+    retention_days: z.number().int().min(1).max(90).default(30),
+  }).strict().default({ enabled: false, retention_days: 30 }),
 }).strict().superRefine((workspace, context) => {
   if (workspace.environments.prod?.access_mode === 'read_write') {
     context.addIssue({
@@ -79,6 +83,7 @@ export interface WorkspaceContext {
   readonly environments: ReadonlyMap<ConnectionEnvironment, WorkspaceEnvironment>;
   readonly businessPackPaths: readonly string[];
   readonly auditRetentionDays: number;
+  readonly discovery: Readonly<{ enabled: boolean; retentionDays: number }>;
 }
 
 export interface RuntimeOptions {
@@ -152,6 +157,7 @@ function toContext(descriptorPath: string, document: WorkspaceDocument): Workspa
     environments,
     businessPackPaths: Object.freeze(document.business_pack_paths.map((path) => resolve(descriptorDirectory, path))),
     auditRetentionDays: document.audit_retention_days,
+    discovery: Object.freeze({ enabled: document.discovery.enabled, retentionDays: document.discovery.retention_days }),
   });
 }
 
