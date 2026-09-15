@@ -187,6 +187,10 @@ describe('MySQL MCP server', () => {
       name: 'connection_add',
       arguments: {
         alias: 'auto-fat',
+        datasource_id: 'autoserver-fat',
+        environment: 'test',
+        owner_scope: 'workspace:autoserver',
+        shareable: true,
         host: '127.0.0.1',
         username: 'agent',
         password: 'test-password',
@@ -198,11 +202,38 @@ describe('MySQL MCP server', () => {
     expect(JSON.stringify(added.content)).toContain('auto-fat');
     expect(JSON.stringify(added.content)).not.toContain('test-password');
 
+    const updated = await client.callTool({
+      name: 'connection_update',
+      arguments: { alias: 'auto-fat', description: 'AutoServer FAT' },
+    });
+    expect(updated.isError).toBe(false);
+    expect(updated.structuredContent).toEqual(expect.objectContaining({
+      connection: expect.objectContaining({
+        datasourceId: 'autoserver-fat',
+        environment: 'test',
+        ownerScope: 'workspace:autoserver',
+        shareable: true,
+      }),
+    }));
+    expect(JSON.stringify(updated.structuredContent)).not.toContain('test-password');
+
     const listed = await client.callTool({ name: 'connection_list', arguments: {} });
     expect(listed.isError).toBe(false);
+    expect(listed.structuredContent).toEqual(expect.objectContaining({
+      connections: [expect.objectContaining({
+        alias: 'auto-fat',
+        datasourceId: 'autoserver-fat',
+        environment: 'test',
+        ownerScope: 'workspace:autoserver',
+        shareable: true,
+        poolMax: 2,
+      })],
+    }));
     expect(JSON.stringify(listed.structuredContent)).toContain('auto-fat');
     expect(JSON.stringify(listed.structuredContent)).not.toContain('test-password');
     expect(JSON.stringify(listed.content)).toContain('auto-fat');
+    expect(JSON.stringify(listed.content)).toContain('autoserver-fat');
+    expect(JSON.stringify(listed.content)).toContain('workspace:autoserver');
     expect(JSON.stringify(listed.content)).toContain('auto_server_fat');
     expect(JSON.stringify(listed.content)).not.toContain('test-password');
 

@@ -16,7 +16,7 @@ const config: ConnectionConfig = {
   accessMode: 'read_write',
   connectTimeoutMs: 1000,
   queryTimeoutMs: 5000,
-  poolMax: 10,
+  poolMax: 2,
   idleTimeoutMs: 60000,
   enabled: true,
   revision: 1,
@@ -25,7 +25,7 @@ const config: ConnectionConfig = {
 };
 
 describe('ConnectionRuntime bulkhead', () => {
-  it('runs at most 10 operations, queues 40, and rejects the rest', async () => {
+  it('runs at most 2 operations, queues 8, and rejects the rest', async () => {
     const runtime = new ConnectionRuntime(config);
     let active = 0;
     let maxActive = 0;
@@ -34,7 +34,7 @@ describe('ConnectionRuntime bulkhead', () => {
       release = resolve;
     });
 
-    const calls = Array.from({ length: 60 }, () =>
+    const calls = Array.from({ length: 12 }, () =>
       runtime
         .run({ timeoutMs: 5000, retrySafeAfterSend: false }, async () => {
           active += 1;
@@ -52,13 +52,13 @@ describe('ConnectionRuntime bulkhead', () => {
     release();
     const results = await Promise.all(calls);
 
-    expect(maxActive).toBe(10);
-    expect(results.filter((result) => result.ok)).toHaveLength(50);
+    expect(maxActive).toBe(2);
+    expect(results.filter((result) => result.ok)).toHaveLength(10);
     expect(
       results.filter(
         (result) => !result.ok && (result.error as { code?: string }).code === 'BUSY',
       ),
-    ).toHaveLength(10);
+    ).toHaveLength(2);
     await runtime.close();
   });
 });

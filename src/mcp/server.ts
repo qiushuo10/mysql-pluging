@@ -174,6 +174,10 @@ function registerBaseTools(server: McpServer, store: StateStore, service: MysqlS
       safe(() => {
         const summary = store.addConnection({
           alias: args.alias,
+          datasourceId: args.datasource_id,
+          environment: args.environment,
+          ownerScope: args.owner_scope,
+          shareable: args.shareable,
           description: args.description,
           host: args.host,
           port: args.port,
@@ -205,6 +209,10 @@ function registerBaseTools(server: McpServer, store: StateStore, service: MysqlS
       safe(async () => {
         const summary = store.updateConnection({
           alias: args.alias,
+          datasourceId: args.datasource_id,
+          environment: args.environment,
+          ownerScope: args.owner_scope,
+          shareable: args.shareable,
           description: args.description,
           host: args.host,
           port: args.port,

@@ -9,6 +9,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_POOL_MAX,
   DEFAULT_QUERY_TIMEOUT_MS,
+  MAX_POOL_MAX,
   MAX_SCHEMA_SNAPSHOT_BYTES,
   SCHEMA_SNAPSHOT_FORMAT_VERSION,
   STATE_SCHEMA_VERSION,
@@ -21,12 +22,17 @@ import type {
   AuditHistoryRecord,
   AuditRecord,
   ConnectionConfig,
+  ConnectionEnvironment,
   ConnectionSummary,
   SchemaSnapshotRecord,
 } from '../types.js';
 
 export interface AddConnectionInput {
   alias: string;
+  datasourceId?: string;
+  environment?: ConnectionEnvironment;
+  ownerScope?: string;
+  shareable?: boolean;
   description?: string | null;
   host: string;
   port?: number;
@@ -47,6 +53,10 @@ export type UpdateConnectionInput = Partial<Omit<AddConnectionInput, 'alias'>> &
 
 interface ConnectionRow {
   alias: string;
+  datasource_id: string | null;
+  environment: string;
+  owner_scope: string;
+  shareable: number;
   description: string | null;
   host: string;
   port: number;
@@ -130,6 +140,10 @@ export class StateStore {
         this.database.exec(`
         CREATE TABLE IF NOT EXISTS connections (
           alias TEXT PRIMARY KEY,
+          datasource_id TEXT NOT NULL,
+          environment TEXT NOT NULL DEFAULT 'custom',
+          owner_scope TEXT NOT NULL DEFAULT 'global',
+          shareable INTEGER NOT NULL DEFAULT 0,
           description TEXT,
           host TEXT NOT NULL,
           port INTEGER NOT NULL DEFAULT 3306,
@@ -141,7 +155,7 @@ export class StateStore {
           access_mode TEXT NOT NULL DEFAULT 'read_write',
           connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
           query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-          pool_max INTEGER NOT NULL DEFAULT 10,
+          pool_max INTEGER NOT NULL DEFAULT ${DEFAULT_POOL_MAX},
           idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
           enabled INTEGER NOT NULL DEFAULT 1,
           revision INTEGER NOT NULL DEFAULT 1,
@@ -243,6 +257,66 @@ export class StateStore {
         `);
         this.recordMigration(4);
       }
+      if (current < 5) {
+        const connectionColumns = this.database.prepare('PRAGMA table_info(connections)').all() as Array<{ name: string; dflt_value: string | null }>;
+        const names = new Set(connectionColumns.map((column) => column.name));
+        if (connectionColumns.length > 0) {
+          if (!names.has('datasource_id')) this.database.exec('ALTER TABLE connections ADD COLUMN datasource_id TEXT');
+          if (!names.has('environment')) this.database.exec("ALTER TABLE connections ADD COLUMN environment TEXT NOT NULL DEFAULT 'custom'");
+          if (!names.has('owner_scope')) this.database.exec("ALTER TABLE connections ADD COLUMN owner_scope TEXT NOT NULL DEFAULT 'global'");
+          if (!names.has('shareable')) this.database.exec('ALTER TABLE connections ADD COLUMN shareable INTEGER NOT NULL DEFAULT 0');
+          this.database.exec("UPDATE connections SET datasource_id = alias WHERE datasource_id IS NULL OR datasource_id = ''");
+          this.database
+            .prepare('UPDATE connections SET pool_max = ?, revision = revision + 1, updated_at = ? WHERE pool_max > ?')
+            .run(MAX_POOL_MAX, new Date().toISOString(), MAX_POOL_MAX);
+          const poolDefault = connectionColumns.find((column) => column.name === 'pool_max')?.dflt_value;
+          if (poolDefault !== String(DEFAULT_POOL_MAX)) {
+            this.database.exec(`
+              CREATE TABLE _connections_v5_rebuild (
+                alias TEXT PRIMARY KEY,
+                datasource_id TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'custom',
+                owner_scope TEXT NOT NULL DEFAULT 'global',
+                shareable INTEGER NOT NULL DEFAULT 0,
+                description TEXT,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 3306,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                default_database TEXT NOT NULL,
+                allowed_databases_json TEXT NOT NULL DEFAULT '[]',
+                charset TEXT NOT NULL DEFAULT 'utf8mb4',
+                access_mode TEXT NOT NULL DEFAULT 'read_write',
+                connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
+                query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+                pool_max INTEGER NOT NULL DEFAULT ${DEFAULT_POOL_MAX},
+                idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+              );
+              INSERT INTO _connections_v5_rebuild (
+                alias, datasource_id, environment, owner_scope, shareable,
+                description, host, port, username, password, default_database,
+                allowed_databases_json, charset, access_mode, connect_timeout_ms,
+                query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+                created_at, updated_at
+              )
+              SELECT
+                alias, datasource_id, environment, owner_scope, shareable,
+                description, host, port, username, password, default_database,
+                allowed_databases_json, charset, access_mode, connect_timeout_ms,
+                query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+                created_at, updated_at
+              FROM connections;
+              DROP TABLE connections;
+              ALTER TABLE _connections_v5_rebuild RENAME TO connections;
+            `);
+          }
+        }
+        this.recordMigration(5);
+      }
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -260,18 +334,29 @@ export class StateStore {
     const now = new Date().toISOString();
     const allowedDatabases = input.allowedDatabases ?? [input.database];
     this.validateDatabaseScope(input.database, allowedDatabases);
+    this.validatePoolMax(input.poolMax ?? DEFAULT_POOL_MAX);
     try {
       this.database
         .prepare(`
           INSERT INTO connections (
-            alias, description, host, port, username, password, default_database,
+            alias, datasource_id, environment, owner_scope, shareable,
+            description, host, port, username, password, default_database,
             allowed_databases_json, charset, access_mode, connect_timeout_ms,
             query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
             created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            1, ?, ?
+          )
         `)
         .run(
           input.alias,
+          input.datasourceId ?? input.alias,
+          input.environment ?? 'custom',
+          input.ownerScope ?? 'global',
+          input.shareable === true ? 1 : 0,
           input.description ?? null,
           input.host,
           input.port ?? 3306,
@@ -307,6 +392,10 @@ export class StateStore {
     const existing = this.requireConnection(input.alias);
     const next: AddConnectionInput = {
       alias: existing.alias,
+      datasourceId: input.datasourceId ?? existing.datasourceId ?? existing.alias,
+      environment: input.environment ?? existing.environment ?? 'custom',
+      ownerScope: input.ownerScope ?? existing.ownerScope ?? 'global',
+      shareable: input.shareable ?? existing.shareable ?? false,
       description: input.description === undefined ? existing.description : input.description,
       host: input.host ?? existing.host,
       port: input.port ?? existing.port,
@@ -323,11 +412,13 @@ export class StateStore {
       enabled: input.enabled ?? existing.enabled,
     };
     this.validateDatabaseScope(next.database, next.allowedDatabases ?? [next.database]);
+    this.validatePoolMax(next.poolMax ?? DEFAULT_POOL_MAX);
     const now = new Date().toISOString();
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const updated = this.database.prepare(`
         UPDATE connections SET
+          datasource_id = ?, environment = ?, owner_scope = ?, shareable = ?,
           description = ?, host = ?, port = ?, username = ?, password = ?,
           default_database = ?, allowed_databases_json = ?, charset = ?,
           access_mode = ?, connect_timeout_ms = ?, query_timeout_ms = ?,
@@ -335,6 +426,10 @@ export class StateStore {
           updated_at = ?
         WHERE alias = ?
       `).run(
+        next.datasourceId ?? next.alias,
+        next.environment ?? 'custom',
+        next.ownerScope ?? 'global',
+        next.shareable === true ? 1 : 0,
         next.description ?? null,
         next.host,
         next.port ?? 3306,
@@ -363,6 +458,10 @@ export class StateStore {
     }
     return this.toSummary({
       ...existing,
+      datasourceId: next.datasourceId ?? next.alias,
+      environment: next.environment ?? 'custom',
+      ownerScope: next.ownerScope ?? 'global',
+      shareable: next.shareable ?? false,
       description: next.description ?? null,
       host: next.host,
       port: next.port ?? 3306,
@@ -617,6 +716,10 @@ export class StateStore {
   private fromRow(row: ConnectionRow): ConnectionConfig {
     return {
       alias: row.alias,
+      datasourceId: row.datasource_id || row.alias,
+      environment: (row.environment || 'custom') as ConnectionEnvironment,
+      ownerScope: row.owner_scope || 'global',
+      shareable: row.shareable === 1,
       description: row.description,
       host: row.host,
       port: row.port,
@@ -648,6 +751,16 @@ export class StateStore {
         category: 'argument_error',
         code: 'DEFAULT_DATABASE_NOT_ALLOWED',
         message: `allowed_databases 必须包含默认数据库 ${database}。`,
+      });
+    }
+  }
+
+  private validatePoolMax(poolMax: number): void {
+    if (!Number.isInteger(poolMax) || poolMax < 1 || poolMax > MAX_POOL_MAX) {
+      throw new PluginError({
+        category: 'argument_error',
+        code: 'POOL_MAX_OUT_OF_RANGE',
+        message: `pool_max 必须是 1 到 ${MAX_POOL_MAX} 之间的整数。`,
       });
     }
   }

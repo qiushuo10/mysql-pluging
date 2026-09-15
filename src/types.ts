@@ -1,10 +1,15 @@
 export type AccessMode = 'read_only' | 'read_write';
+export type ConnectionEnvironment = 'dev' | 'test' | 'staging' | 'prod' | 'custom';
 export type StatementKind = 'select' | 'show' | 'describe' | 'explain' | 'insert' | 'update' | 'delete';
 export type BusinessMode = 'read' | 'insert' | 'update' | 'delete';
 export type WriteOutcome = 'not_applicable' | 'not_sent' | 'known_failed' | 'committed' | 'unknown';
 
 export interface ConnectionConfig {
   alias: string;
+  datasourceId?: string;
+  environment?: ConnectionEnvironment;
+  ownerScope?: string;
+  shareable?: boolean;
   description: string | null;
   host: string;
   port: number;

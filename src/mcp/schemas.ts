@@ -1,8 +1,11 @@
 import { z } from 'zod';
 
-import { ALIAS_PATTERN, DEFAULT_MAX_ROWS, MAX_AFFECTED_ROWS, MAX_MAX_ROWS, MAX_POOL_MAX } from '../constants.js';
+import { ALIAS_PATTERN, DEFAULT_MAX_ROWS, DEFAULT_POOL_MAX, MAX_AFFECTED_ROWS, MAX_MAX_ROWS, MAX_POOL_MAX } from '../constants.js';
 
 const alias = z.string().regex(ALIAS_PATTERN).describe('已配置的数据源别名，例如 auto-dev。');
+const datasourceId = z.string().regex(ALIAS_PATTERN).describe('稳定的数据源标识；省略时使用 alias。');
+const environment = z.enum(['dev', 'test', 'staging', 'prod', 'custom']);
+const ownerScope = z.string().min(1).max(256);
 const database = z.string().min(1).max(64).describe('默认 MySQL 数据库名。');
 const allowedDatabases = z.array(database).min(1).max(32).describe('该连接允许访问的数据库白名单。');
 // Keep the MCP schema broad enough for unsafe JSON numbers to reach the plugin's
@@ -14,6 +17,10 @@ export const sqlParameters = z
   .describe('命名参数对象。SQL 中用 :name 绑定标量，用 :...names 展开非空列表；值不得拼进 SQL 文本。MySQL BIGINT、雪花 ID 等可能超过 JavaScript 安全整数范围的值必须使用 JSON 字符串。');
 
 const connectionFields = {
+  datasource_id: datasourceId.optional(),
+  environment: environment.default('custom'),
+  owner_scope: ownerScope.default('global'),
+  shareable: z.boolean().default(false),
   description: z.string().max(256).nullable().optional(),
   host: z.string().min(1).max(253),
   port: z.number().int().min(1).max(65_535).default(3306),
@@ -25,7 +32,7 @@ const connectionFields = {
   access_mode: z.enum(['read_only', 'read_write']).default('read_write'),
   connect_timeout_ms: z.number().int().min(1_000).max(30_000).default(5_000),
   query_timeout_ms: z.number().int().min(100).max(300_000).default(30_000),
-  pool_max: z.number().int().min(1).max(MAX_POOL_MAX).default(10),
+  pool_max: z.number().int().min(1).max(MAX_POOL_MAX).default(DEFAULT_POOL_MAX),
   idle_timeout_ms: z.number().int().min(10_000).max(600_000).default(60_000),
   enabled: z.boolean().default(true),
 };
@@ -46,6 +53,10 @@ export const connectionAddSchema = z
 export const connectionUpdateSchema = z
   .object({
     alias,
+    datasource_id: datasourceId.optional(),
+    environment: environment.optional(),
+    owner_scope: ownerScope.optional(),
+    shareable: z.boolean().optional(),
     description: connectionFields.description,
     host: connectionFields.host.optional(),
     port: connectionFields.port.optional(),

@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { StateStore } from '../src/config/store.js';
-import { SCHEMA_SNAPSHOT_FORMAT_VERSION } from '../src/constants.js';
+import { SCHEMA_SNAPSHOT_FORMAT_VERSION, STATE_SCHEMA_VERSION } from '../src/constants.js';
 
 const homes: string[] = [];
 
@@ -32,16 +32,29 @@ describe('StateStore', () => {
     });
 
     expect(summary).not.toHaveProperty('password');
-    expect(summary.poolMax).toBe(10);
+    expect(summary).toEqual(expect.objectContaining({
+      datasourceId: 'auto-fat',
+      environment: 'custom',
+      ownerScope: 'global',
+      shareable: false,
+      poolMax: 2,
+    }));
     expect(store.requireConnection('auto-fat').password).toBe('local-test-password');
+    expect(store.listConnections()[0]).toEqual(expect.objectContaining({
+      datasourceId: 'auto-fat', environment: 'custom', ownerScope: 'global', shareable: false,
+    }));
     expect(store.listConnections()[0]).not.toHaveProperty('password');
     store.close();
   });
 
-  it('increments revision and preserves omitted password fields', () => {
+  it('increments revision and preserves omitted password and metadata fields', () => {
     const store = createStore();
     store.addConnection({
       alias: 'voicehub-test',
+      datasourceId: 'voicehub-primary',
+      environment: 'staging',
+      ownerScope: 'team:voicehub',
+      shareable: true,
       host: 'localhost',
       username: 'agent',
       password: 'secret',
@@ -50,7 +63,30 @@ describe('StateStore', () => {
 
     const updated = store.updateConnection({ alias: 'voicehub-test', description: 'VoiceHub test data' });
     expect(updated.revision).toBe(2);
+    expect(updated).toEqual(expect.objectContaining({
+      datasourceId: 'voicehub-primary', environment: 'staging', ownerScope: 'team:voicehub', shareable: true,
+    }));
     expect(store.requireConnection('voicehub-test').password).toBe('secret');
+
+    const metadataUpdated = store.updateConnection({
+      alias: 'voicehub-test',
+      datasourceId: 'voicehub-secondary',
+      environment: 'prod',
+      ownerScope: 'global',
+      shareable: false,
+    });
+    expect(metadataUpdated).toEqual(expect.objectContaining({
+      datasourceId: 'voicehub-secondary', environment: 'prod', ownerScope: 'global', shareable: false, revision: 3,
+    }));
+    expect(store.requireConnection('voicehub-test').password).toBe('secret');
+    store.close();
+  });
+
+  it('rejects pool sizes above the physical connection cap', () => {
+    const store = createStore();
+    expect(() => store.addConnection({
+      alias: 'too-wide', host: 'localhost', username: 'agent', password: '', database: 'app', poolMax: 3,
+    })).toThrow(/pool_max/);
     store.close();
   });
 
@@ -164,11 +200,51 @@ describe('StateStore', () => {
     expect((inspect.prepare('PRAGMA table_info(execution_audit)').all() as Array<{ name: string }>).map((row) => row.name)).toEqual(
       expect.arrayContaining(['business_pack_id', 'business_pack_version', 'business_operation_hash']),
     );
-    expect((inspect.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }).version).toBe(4);
+    expect((inspect.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }).version).toBe(STATE_SCHEMA_VERSION);
     inspect.close();
     const second = new StateStore(home);
     second.close();
     first.close();
+  });
+
+  it('migrates legacy connection metadata and clamps oversized pools once', () => {
+    const home = mkdtempSync(join(tmpdir(), 'mysql-agent-store-v4-'));
+    homes.push(home);
+    const path = join(home, 'state.db');
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations VALUES (1, 'old'), (2, 'old'), (3, 'old'), (4, 'old');
+      CREATE TABLE connections (
+        alias TEXT PRIMARY KEY, description TEXT, host TEXT NOT NULL, port INTEGER NOT NULL,
+        username TEXT NOT NULL, password TEXT NOT NULL, default_database TEXT NOT NULL,
+        allowed_databases_json TEXT NOT NULL, charset TEXT NOT NULL, access_mode TEXT NOT NULL,
+        connect_timeout_ms INTEGER NOT NULL, query_timeout_ms INTEGER NOT NULL,
+        pool_max INTEGER NOT NULL DEFAULT 10, idle_timeout_ms INTEGER NOT NULL,
+        enabled INTEGER NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO connections VALUES
+        ('legacy-prod', NULL, 'localhost', 3306, 'agent', 'secret', 'app', '["app"]', 'utf8mb4', 'read_write', 5000, 30000, 10, 60000, 1, 7, 'old', 'old'),
+        ('legacy-small', NULL, 'localhost', 3306, 'agent', 'secret', 'app', '["app"]', 'utf8mb4', 'read_write', 5000, 30000, 2, 60000, 1, 4, 'old', 'old');
+    `);
+    legacy.close();
+
+    const first = new StateStore(home);
+    expect(first.requireConnection('legacy-prod')).toEqual(expect.objectContaining({
+      datasourceId: 'legacy-prod', environment: 'custom', ownerScope: 'global', shareable: false,
+      poolMax: 2, revision: 8,
+    }));
+    expect(first.requireConnection('legacy-small')).toEqual(expect.objectContaining({ poolMax: 2, revision: 4 }));
+    first.close();
+
+    const second = new StateStore(home);
+    expect(second.requireConnection('legacy-prod').revision).toBe(8);
+    const inspect = new DatabaseSync(path);
+    expect((inspect.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }).version).toBe(STATE_SCHEMA_VERSION);
+    expect((inspect.prepare('PRAGMA table_info(connections)').all() as Array<{ name: string; dflt_value: string | null }>)
+      .find((column) => column.name === 'pool_max')?.dflt_value).toBe('2');
+    inspect.close();
+    second.close();
   });
 
   it('rejects a state database newer than this plugin', () => {
