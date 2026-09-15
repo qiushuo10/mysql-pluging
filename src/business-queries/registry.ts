@@ -14,6 +14,49 @@ import type { SqlParameters, SqlScalar } from '../types.js';
 import type { ConnectionEnvironment } from '../types.js';
 import type { BusinessOperation } from './definition.js';
 
+const SCRIPT_CHILD_CLEANUP_TIMEOUT_MS = 500;
+
+interface SafeHostError {
+  stepIndex: number;
+  category: PluginError['category'];
+  code: string;
+  retryable: boolean;
+  writeOutcome: PluginError['writeOutcome'];
+}
+
+interface TrackedChild {
+  context: ExecutionContext;
+  finished: boolean;
+  settled: Promise<void>;
+}
+
+function scriptChildResult(value: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const key of [
+    'schema_version', 'status', 'kind', 'columns', 'rows', 'row_count', 'truncated',
+    'duration_ms', 'attempt_count', 'queue_duration_ms', 'business_operation_id',
+    'business_pack_id', 'business_pack_version', 'business_operation_hash',
+  ]) {
+    if (Object.hasOwn(value, key)) output[key] = value[key];
+  }
+  return output;
+}
+
+function safeHostPluginError(error: PluginError, stepIndex: number): SafeHostError {
+  return {
+    stepIndex, category: error.category, code: error.code, retryable: error.retryable,
+    writeOutcome: error.writeOutcome,
+  };
+}
+
+function restoredHostError(error: SafeHostError): PluginError {
+  return new PluginError({
+    category: error.category, code: error.code,
+    message: '业务脚本内部操作失败；详细原因已脱敏，请通过 trace_id 检查对应步骤。',
+    retryable: error.retryable, writeOutcome: error.writeOutcome,
+  });
+}
+
 export class BusinessOperationRegistry {
   private readonly operations: readonly BusinessOperation[];
   private readonly byId: Map<string, BusinessOperation>;
@@ -235,44 +278,117 @@ export class BusinessOperationRegistry {
     }
     const parsed = operation.input.parse(input) as Record<string, unknown>;
     let stepIndex = 0;
-    const result = await this.scriptRuntime.execute({
-      id: operation.id,
-      source: operation.script!,
-      timeoutMs: operation.timeoutMs ?? 10_000,
-      maxResultBytes: operation.maxResultBytes ?? 262_144,
-      input: parsed,
-      signal,
-      callOperation: async (operationId, childInput, childSignal) => {
-        if (!operation.uses.includes(operationId)) {
-          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_OPERATION_NOT_ALLOWED', message: '脚本请求了未授权的内部操作。' });
+    const trackedChildren: TrackedChild[] = [];
+    const hostErrors: SafeHostError[] = [];
+    let runtimeResult: Awaited<ReturnType<BusinessScriptRuntime['execute']>> | undefined;
+    let runtimeError: unknown;
+    try {
+      runtimeResult = await this.scriptRuntime.execute({
+        id: operation.id,
+        source: operation.script!,
+        timeoutMs: operation.timeoutMs ?? 10_000,
+        maxResultBytes: operation.maxResultBytes ?? 262_144,
+        input: parsed,
+        signal,
+        callOperation: async (operationId, childInput, childSignal) => {
+          const childStep = ++stepIndex;
+          try {
+            if (!operation.uses.includes(operationId)) {
+              throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_OPERATION_NOT_ALLOWED', message: '脚本请求了未授权的内部操作。' });
+            }
+            const matches = this.operations.filter((candidate) => candidate.kind === 'sql'
+              && candidate.id === operationId && candidate.environment === operation.environment);
+            if (matches.length !== 1) {
+              throw new PluginError({ category: 'config_error', code: 'BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', message: `内部操作 ${operationId} 无法在当前环境唯一解析。` });
+            }
+            const dependency = matches[0]!;
+            if (dependency.mode !== 'read') {
+              throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_WRITE_FORBIDDEN', message: '脚本只能调用只读业务操作。' });
+            }
+            const datasourceId = dependency.datasourceIds[0];
+            if (!datasourceId || !operation.datasourceIds.includes(datasourceId)) {
+              throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_DATASOURCE_NOT_ALLOWED', message: '脚本请求了未声明的数据源。' });
+            }
+            const live = executionContext.resolveConnection!(datasourceId);
+            if (dependency.connection !== live.alias || operation.connectionBindings[datasourceId] !== live.alias) {
+              throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_TARGET_CHANGED', message: '脚本依赖的 workspace binding 已变化，请重新连接。' });
+            }
+            const childContext = executionContext.traceRecorder!.startChild(executionContext.traceContext!, {
+              operationId: dependency.id, operationKind: 'sql', datasourceId, environment: operation.environment,
+              connectionAlias: live.alias, stepIndex: childStep,
+            });
+            const tracked: TrackedChild = { context: childContext, finished: false, settled: Promise.resolve() };
+            const work = (async () => {
+              try {
+                const childValue = await this.execute(dependency, childInput, service, childSignal, clientName, {
+                  workspaceId: executionContext.workspaceId, datasourceId, environment: operation.environment!,
+                  expectedConnection: live.identity, publicOperationId: dependency.id, traceContext: childContext,
+                });
+                if (!tracked.finished) {
+                  tracked.finished = true;
+                  executionContext.traceRecorder!.finishSpan(childContext, {
+                    status: 'ok', result: childValue,
+                    queueDurationMs: Number(childValue.queue_duration_ms ?? 0),
+                  });
+                }
+                return scriptChildResult(childValue);
+              } catch (error) {
+                if (!tracked.finished) {
+                  tracked.finished = true;
+                  const plugin = error as { category?: string; code?: string; queueDurationMs?: unknown };
+                  executionContext.traceRecorder!.finishSpan(childContext, {
+                    status: plugin.code === 'REQUEST_CANCELLED' ? 'cancelled' : 'error',
+                    errorCategory: plugin.category ?? 'internal_error',
+                    queueDurationMs: Number(plugin.queueDurationMs ?? 0),
+                  });
+                }
+                throw error;
+              }
+            })();
+            tracked.settled = work.then(() => undefined, () => undefined);
+            trackedChildren.push(tracked);
+            return await work;
+          } catch (error) {
+            if (error instanceof PluginError) hostErrors.push(safeHostPluginError(error, childStep));
+            throw new Error('业务脚本内部操作失败。');
+          }
+        },
+      });
+    } catch (error) {
+      runtimeError = error;
+    } finally {
+      const pending = trackedChildren.filter((child) => !child.finished);
+      if (pending.length > 0) {
+        let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.allSettled(pending.map((child) => child.settled)),
+            new Promise<void>((resolveDelay) => { cleanupTimer = setTimeout(resolveDelay, SCRIPT_CHILD_CLEANUP_TIMEOUT_MS); }),
+          ]);
+        } finally {
+          if (cleanupTimer) clearTimeout(cleanupTimer);
         }
-        const matches = this.operations.filter((candidate) => candidate.kind === 'sql'
-          && candidate.id === operationId && candidate.environment === operation.environment);
-        if (matches.length !== 1) {
-          throw new PluginError({ category: 'config_error', code: 'BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', message: `内部操作 ${operationId} 无法在当前环境唯一解析。` });
+        for (const child of pending) {
+          if (child.finished) continue;
+          child.finished = true;
+          executionContext.traceRecorder.finishSpan(child.context, {
+            status: signal?.aborted || (runtimeError as { code?: unknown } | undefined)?.code === 'REQUEST_CANCELLED'
+              || (runtimeError as { code?: unknown } | undefined)?.code === 'BUSINESS_SCRIPT_TIMEOUT'
+              ? 'cancelled' : 'error',
+            errorCategory: (runtimeError as { category?: string } | undefined)?.category ?? 'internal_error',
+          });
         }
-        const dependency = matches[0]!;
-        if (dependency.mode !== 'read') {
-          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_WRITE_FORBIDDEN', message: '脚本只能调用只读业务操作。' });
-        }
-        const datasourceId = dependency.datasourceIds[0];
-        if (!datasourceId || !operation.datasourceIds.includes(datasourceId)) {
-          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_DATASOURCE_NOT_ALLOWED', message: '脚本请求了未声明的数据源。' });
-        }
-        const live = executionContext.resolveConnection!(datasourceId);
-        if (dependency.connection !== live.alias || operation.connectionBindings[datasourceId] !== live.alias) {
-          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_TARGET_CHANGED', message: '脚本依赖的 workspace binding 已变化，请重新连接。' });
-        }
-        const childStep = ++stepIndex;
-        return executionContext.traceRecorder!.withChild(executionContext.traceContext!, {
-          operationId: dependency.id, operationKind: 'sql', datasourceId, environment: operation.environment,
-          connectionAlias: live.alias, stepIndex: childStep,
-        }, (childTrace) => this.execute(dependency, childInput, service, childSignal, clientName, {
-          workspaceId: executionContext.workspaceId, datasourceId, environment: operation.environment!,
-          expectedConnection: live.identity, publicOperationId: dependency.id, traceContext: childTrace,
-        }));
-      },
-    });
+      }
+    }
+    if (runtimeError !== undefined) {
+      const code = (runtimeError as { code?: unknown })?.code;
+      if (code === 'BUSINESS_SCRIPT_HOST_CALL_FAILED' && hostErrors.length > 0) {
+        hostErrors.sort((left, right) => left.stepIndex - right.stepIndex);
+        throw restoredHostError(hostErrors[0]!);
+      }
+      throw runtimeError;
+    }
+    const result = runtimeResult!;
     return {
       schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'business_script',
       business_operation_id: executionContext.publicOperationId ?? operation.id,

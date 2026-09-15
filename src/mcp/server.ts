@@ -8,6 +8,7 @@ import { BusinessOperationRegistry, businessDirectToolName } from '../business-q
 import type { BusinessOperation } from '../business-queries/definition.js';
 import {
   loadBusinessOperations,
+  loadBusinessOperationsFromHomes,
   type LoadedBusinessPack,
 } from '../business-packs/loader.js';
 import { StateStore } from '../config/store.js';
@@ -544,16 +545,16 @@ export function createMysqlMcpApplication(options: {
     throw new PluginError({ category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_REQUIRED', message: 'workspace 模式必须显式提供 workspacePath。' });
   }
   const workspaceManager = mode === 'workspace' ? new WorkspaceManager(options.workspacePath!) : null;
-  const workspaceLoads = workspaceManager && !options.operations
-    ? workspaceManager.context.businessPackPaths.map((path) => loadBusinessOperations(path, { workspace: workspaceManager.context }))
-    : [];
+  const workspaceLoad = workspaceManager && !options.operations
+    ? loadBusinessOperationsFromHomes(workspaceManager.context.businessPackPaths, { workspace: workspaceManager.context })
+    : null;
   const loaded = options.operations
     ? { operations: options.operations, packs: [] as const, disabledOperations: [] as const, home: null }
     : workspaceManager
       ? {
-          operations: workspaceLoads.flatMap((item) => [...item.operations]),
-          packs: workspaceLoads.flatMap((item) => [...item.packs]),
-          disabledOperations: workspaceLoads.flatMap((item) => [...item.disabledOperations]),
+          operations: workspaceLoad?.operations ?? [],
+          packs: workspaceLoad?.packs ?? [],
+          disabledOperations: workspaceLoad?.disabledOperations ?? [],
           home: workspaceManager.context.businessPackPaths[0] ?? null,
         }
       : mode === 'admin'

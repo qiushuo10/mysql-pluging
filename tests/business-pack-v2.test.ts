@@ -6,8 +6,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadBusinessOperations } from '../src/business-packs/loader.js';
+import { loadBusinessOperations, loadBusinessOperationsFromHomes } from '../src/business-packs/loader.js';
 import { StateStore } from '../src/config/store.js';
+import { PluginError } from '../src/errors.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from '../src/mcp/server.js';
 import { loadWorkspaceContext } from '../src/workspace/context.js';
 
@@ -145,7 +146,11 @@ describe('business pack v2', () => {
         businessOperationHash: request.businessOperationHash ?? null, statementKind: 'select', sqlHash: 'test', durationMs: 1,
         rowCount: 1, affectedRows: null, attemptCount: 1, writeOutcome: 'not_applicable', status: 'ok', errorCategory: null, mysqlErrorCode: null,
       });
-      return { schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'query', connection: request.connection, rows: [{ id: 'A1' }], row_count: 1 };
+      return {
+        schema_version: 'mysql-agent/result/1', execution_id: 'internal-child-execution', status: 'ok', kind: 'query',
+        connection: request.connection, database: 'secret_internal_database', rows: [{ id: 'A1' }], row_count: 1,
+        columns: [{ name: 'id', database_type: 'VARCHAR' }], truncated: false, duration_ms: 1, attempt_count: 1,
+      };
     };
     const client = await connect(app);
     const tools = (await client.listTools()).tools;
@@ -163,6 +168,7 @@ describe('business pack v2', () => {
       business_pack_id: 'sample-v2', business_pack_version: '2.0.0',
       business_operation_hash: expect.stringMatching(/^sha256:/), script_hash: expect.stringMatching(/^sha256:/),
     }));
+    expect(JSON.stringify(response.structuredContent)).not.toMatch(/auto-test|proof-test|secret_internal_database|internal-child-execution/);
     const runId = String((response.structuredContent as Record<string, unknown>).run_id);
     const runs = app.store.searchExecutionRuns({ workspaceId: 'v2-test', runId, limit: 10 });
     expect(runs.records).toHaveLength(1);
@@ -188,8 +194,113 @@ describe('business pack v2', () => {
     const client = await connect(app);
     const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'TOP-SECRET' } });
     expect(response.isError).toBe(true);
-    expect(response.structuredContent).toEqual(expect.objectContaining({ code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(response.structuredContent).toEqual(expect.objectContaining({ code: 'BUSINESS_SCRIPT_OPERATION_NOT_ALLOWED' }));
     expect(JSON.stringify(response)).not.toContain('TOP-SECRET');
+    await client.close(); await app.close();
+  });
+
+  it('does not expose the original host error when sandbox code catches it', async () => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      const input = await workflow.input();
+      try {
+        return await operations.call('order.find', input);
+      } catch (error) {
+        return { caught: String(error), message: error && error.message };
+      }
+    `);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => {
+      throw new PluginError({
+        category: 'permission_error', code: 'READ_ONLY_CONNECTION',
+        message: 'secret alias auto-test and database secret_internal_database',
+      });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(false);
+    expect(JSON.stringify(response)).not.toMatch(/auto-test|secret_internal_database|READ_ONLY_CONNECTION/);
+    await client.close(); await app.close();
+  });
+
+  it.each([
+    ['argument_error', 'INVALID_BUSINESS_PARAMETER_VALUE', false],
+    ['permission_error', 'READ_ONLY_CONNECTION', false],
+    ['timeout', 'MYSQL_QUERY_TIMEOUT', true],
+  ] as const)('preserves safe host PluginError semantics for %s', async (category, code, retryable) => {
+    const state = fixture();
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => {
+      throw new PluginError({
+        category, code, retryable, writeOutcome: 'not_applicable',
+        message: 'secret alias auto-test and database secret_internal_database',
+      });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category, code, retryable }));
+    expect(JSON.stringify(response)).not.toMatch(/auto-test|secret_internal_database/);
+    await client.close(); await app.close();
+  });
+
+  it('selects the lowest script step deterministically when concurrent host calls fail', async () => {
+    const state = fixture();
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async (request) => {
+      if (request.businessOperationId === 'order.find') {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 40));
+        throw new PluginError({ category: 'argument_error', code: 'FIRST_STEP_FAILED', message: 'secret first error' });
+      }
+      throw new PluginError({ category: 'permission_error', code: 'SECOND_STEP_FAILED', message: 'secret second error' });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'argument_error', code: 'FIRST_STEP_FAILED' }));
+    expect(JSON.stringify(response)).not.toContain('secret first error');
+    await client.close(); await app.close();
+  });
+
+  it('finishes every child span before a timeout root returns even when host work ignores abort', async () => {
+    const state = fixture();
+    const packPath = join(state.packs, 'sample', 'pack.yml');
+    writeFileSync(packPath, readFileSync(packPath, 'utf8').replace('timeout_ms: 3000', 'timeout_ms: 100'));
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    let active = 0;
+    let maximum = 0;
+    const signals: AbortSignal[] = [];
+    app.service.query = async (request) => {
+      active += 1; maximum = Math.max(maximum, active); signals.push(request.requestSignal!);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 800));
+      active -= 1;
+      return { status: 'ok', rows: [], row_count: 0 };
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ code: 'BUSINESS_SCRIPT_TIMEOUT' }));
+    const runId = String((response.structuredContent as Record<string, unknown>).run_id);
+    expect(app.store.listExecutionSpans('v2-test', runId).every((span) => span.status !== 'running')).toBe(true);
+    expect(maximum).toBeLessThanOrEqual(2);
+    expect(signals.every((item) => item.aborted)).toBe(true);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+    expect(active).toBe(0);
+    expect(app.store.listExecutionSpans('v2-test', runId).every((span) => span.status !== 'running')).toBe(true);
+    await client.close(); await app.close();
+  });
+
+  it('terminalizes child spans for host promises that never settle', async () => {
+    const state = fixture();
+    const packPath = join(state.packs, 'sample', 'pack.yml');
+    writeFileSync(packPath, readFileSync(packPath, 'utf8').replace('timeout_ms: 3000', 'timeout_ms: 100'));
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => new Promise<Record<string, unknown>>(() => undefined);
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    const runId = String((response.structuredContent as Record<string, unknown>).run_id);
+    const spans = app.store.listExecutionSpans('v2-test', runId);
+    expect(spans).toHaveLength(3);
+    expect(spans.every((span) => span.status !== 'running')).toBe(true);
     await client.close(); await app.close();
   });
 
@@ -212,7 +323,7 @@ describe('business pack v2', () => {
     const client = await connect(app);
     const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
     expect(response.isError).toBe(true);
-    expect(response.structuredContent).toEqual(expect.objectContaining({ code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'permission_error', code: 'AUTH_TARGET_CHANGED' }));
     expect(queryCalls).toBeLessThanOrEqual(1);
     await client.close(); await app.close();
   });
@@ -268,5 +379,78 @@ operations:
     catch (error) { failure = error; }
     expect(failure).toEqual(expect.objectContaining({ code: 'BUSINESS_SCRIPT_DEPENDENCY_WRITE_FORBIDDEN' }));
     expect(() => loadBusinessOperations(state.packs)).toThrow();
+  });
+
+  it('loads cross-path dependencies as one catalog and rejects global duplicates', async () => {
+    const state = fixture();
+    const homeA = join(state.root, '.mysql-agent', 'packs-a');
+    const homeB = join(state.root, '.mysql-agent', 'packs-b');
+    mkdirSync(join(homeA, 'a', 'sql'), { recursive: true });
+    mkdirSync(join(homeB, 'b', 'scripts'), { recursive: true });
+    writeFileSync(join(homeA, 'a', 'sql', 'find.sql'), 'SELECT :id AS id LIMIT 1');
+    writeFileSync(join(homeA, 'a', 'pack.yml'), `
+schema_version: mysql-agent/business-pack/2
+pack_id: cross-a
+version: 1.0.0
+operations:
+  - id: cross.find
+    kind: sql
+    domain: cross
+    name: find
+    title: Find
+    description: Find one.
+    use_when: Find one.
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input:
+      id: { type: string, min_length: 1, max_length: 64 }
+    sql_file: sql/find.sql
+    max_rows: 1
+`);
+    writeFileSync(join(homeB, 'b', 'scripts', 'read.ts'), `
+const input = await workflow.input();
+return await operations.call('cross.find', input);
+`);
+    const scriptPack = (packId = 'cross-b') => `
+schema_version: mysql-agent/business-pack/2
+pack_id: ${packId}
+version: 1.0.0
+operations:
+  - id: cross.diagnose
+    kind: script
+    domain: cross
+    name: diagnose
+    title: Read
+    description: Read one.
+    use_when: Read one.
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    exposure: direct
+    input:
+      id: { type: string, min_length: 1, max_length: 64 }
+    script_file: scripts/read.ts
+    uses: [cross.find]
+`;
+    writeFileSync(join(homeB, 'b', 'pack.yml'), scriptPack());
+    const workspace = loadWorkspaceContext(state.descriptor);
+    const loaded = loadBusinessOperationsFromHomes([homeA, homeB], { workspace });
+    expect(loaded.operations.map((item) => item.registrationId)).toEqual(['cross.find@test', 'cross.diagnose@test']);
+
+    writeFileSync(join(homeB, 'b', 'pack.yml'), scriptPack('cross-a'));
+    expect(() => loadBusinessOperationsFromHomes([homeA, homeB], { workspace })).toThrow(expect.objectContaining({ code: 'DUPLICATE_BUSINESS_PACK' }));
+
+    writeFileSync(join(homeB, 'b', 'pack.yml'), readFileSync(join(homeA, 'a', 'pack.yml'), 'utf8').replace('pack_id: cross-a', 'pack_id: cross-c'));
+    expect(() => loadBusinessOperationsFromHomes([homeA, homeB], { workspace })).toThrow(expect.objectContaining({ code: 'DUPLICATE_BUSINESS_OPERATION' }));
+
+    writeFileSync(state.descriptor, readFileSync(state.descriptor, 'utf8').replace(
+      'business_pack_paths: [./business-packs]',
+      'business_pack_paths: [./packs-a, ./packs-b]',
+    ));
+    writeFileSync(join(homeB, 'b', 'pack.yml'), scriptPack());
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    expect(app.businessRegistry.all().map((item) => item.registrationId)).toEqual(['cross.find@test', 'cross.diagnose@test']);
+    await app.close();
   });
 });

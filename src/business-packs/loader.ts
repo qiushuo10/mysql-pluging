@@ -246,18 +246,23 @@ function resolveV2(packs: ParsedV2[], workspace: WorkspaceContext): { operations
   return { operations, disabled };
 }
 
-export function loadBusinessOperations(home?: string, options: LoadBusinessOperationsOptions = {}): LoadedBusinessOperations {
-  const configuredHome = home || process.env.MYSQL_AGENT_BUSINESS_PACKS;
-  const resolvedHome = resolve(configuredHome || defaultBusinessPacksHome());
-  if (!existsSync(resolvedHome)) {
-    if (configuredHome) throw packError('BUSINESS_PACKS_HOME_NOT_FOUND', `找不到业务包目录 ${resolvedHome}。`);
-    return { operations: [], packs: [], disabledOperations: [], home: resolvedHome };
+export function loadBusinessOperationsFromHomes(
+  homes: readonly string[],
+  options: LoadBusinessOperationsOptions = {},
+): LoadedBusinessOperations {
+  if (homes.length === 0) return { operations: [], packs: [], disabledOperations: [], home: '' };
+  const resolvedHomes = homes.map((home) => resolve(home));
+  for (const resolvedHome of resolvedHomes) {
+    if (!existsSync(resolvedHome)) throw packError('BUSINESS_PACKS_HOME_NOT_FOUND', `找不到业务包目录 ${resolvedHome}。`);
   }
-  const packFiles = readdirSync(resolvedHome, { withFileTypes: true }).filter((entry) => entry.isDirectory() && !entry.name.startsWith('.')).sort((a, b) => a.name.localeCompare(b.name)).map((entry) => {
-    const path = resolve(resolvedHome, entry.name, 'pack.yml');
-    if (!existsSync(path)) throw packError('BUSINESS_PACK_FILE_NOT_FOUND', `业务包目录 ${entry.name} 缺少 pack.yml。`);
-    return path;
-  });
+  const packFiles = resolvedHomes.flatMap((resolvedHome) => readdirSync(resolvedHome, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const path = resolve(resolvedHome, entry.name, 'pack.yml');
+      if (!existsSync(path)) throw packError('BUSINESS_PACK_FILE_NOT_FOUND', `业务包目录 ${entry.name} 缺少 pack.yml。`);
+      return path;
+    }));
   const operations: BusinessOperation[] = [];
   const packs: LoadedBusinessPack[] = [];
   const v2: ParsedV2[] = [];
@@ -272,5 +277,20 @@ export function loadBusinessOperations(home?: string, options: LoadBusinessOpera
   if (v2.length > 0 && !options.workspace) throw packError('BUSINESS_PACK_V2_WORKSPACE_REQUIRED', '业务包 v2 必须在 workspace context 中加载。');
   const resolved = options.workspace ? resolveV2(v2, options.workspace) : { operations: [], disabled: [] };
   operations.push(...resolved.operations);
-  return { operations, packs, disabledOperations: resolved.disabled, home: resolvedHome };
+  const registrations = new Set<string>();
+  for (const operation of operations) {
+    if (registrations.has(operation.registrationId)) throw packError('DUPLICATE_BUSINESS_OPERATION', `业务操作 ${operation.id} 重复注册。`);
+    registrations.add(operation.registrationId);
+  }
+  return { operations, packs, disabledOperations: resolved.disabled, home: resolvedHomes[0]! };
+}
+
+export function loadBusinessOperations(home?: string, options: LoadBusinessOperationsOptions = {}): LoadedBusinessOperations {
+  const configuredHome = home || process.env.MYSQL_AGENT_BUSINESS_PACKS;
+  const resolvedHome = resolve(configuredHome || defaultBusinessPacksHome());
+  if (!existsSync(resolvedHome)) {
+    if (configuredHome) throw packError('BUSINESS_PACKS_HOME_NOT_FOUND', `找不到业务包目录 ${resolvedHome}。`);
+    return { operations: [], packs: [], disabledOperations: [], home: resolvedHome };
+  }
+  return loadBusinessOperationsFromHomes([resolvedHome], options);
 }
