@@ -82,6 +82,12 @@ function validateBinding(store: StateStore, workspace: WorkspaceContext, target:
       `binding ${target.datasourceId}/${target.environment} 与连接 ${target.alias} 的 datasource/environment 不一致。`,
     );
   }
+  if (target.environment === 'prod' && connection.accessMode !== 'read_only') {
+    throw configError(
+      'WORKSPACE_PROD_CONNECTION_NOT_READ_ONLY',
+      `生产 binding ${target.datasourceId}/prod 只允许绑定物理 access_mode=read_only 的连接。`,
+    );
+  }
   const owned = connection.ownerScope === `workspace:${workspace.workspaceId}`;
   const shared = connection.ownerScope === 'global' && connection.shareable === true;
   if (!owned && !shared) {

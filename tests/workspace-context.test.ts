@@ -78,6 +78,22 @@ environments: { test: { datasource_bindings: { app: app-test } } }
 business_pack_paths: [/tmp/packs]
 `);
     expect(() => loadWorkspaceContext(absolutePack)).toThrow(/必须是相对 descriptor/);
+
+    const writableProd = workspaceFile(`
+schema_version: mysql-agent/workspace/1
+workspace_id: four
+label: Four
+runtime_mode: workspace
+default_datasource: app
+default_environment: test
+environments:
+  test: { datasource_bindings: { app: app-test } }
+  prod:
+    datasource_bindings: { app: app-prod }
+    access_mode: read_write
+business_pack_paths: []
+`);
+    expect(() => loadWorkspaceContext(writableProd)).toThrow(/不符合 mysql-agent\/workspace\/1/);
   });
 });
 

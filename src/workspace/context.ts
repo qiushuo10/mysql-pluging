@@ -44,7 +44,15 @@ const workspaceSchema = z.object({
   environments: z.partialRecord(environmentName, environmentSchema),
   business_pack_paths: z.array(z.string().min(1).max(1_024)).max(32).default([]),
   audit_retention_days: z.number().int().min(1).max(3_650).default(30),
-}).strict();
+}).strict().superRefine((workspace, context) => {
+  if (workspace.environments.prod?.access_mode === 'read_write') {
+    context.addIssue({
+      code: 'custom',
+      path: ['environments', 'prod', 'access_mode'],
+      message: 'prod environment must be read_only in workspace mode',
+    });
+  }
+});
 
 type WorkspaceDocument = z.infer<typeof workspaceSchema>;
 

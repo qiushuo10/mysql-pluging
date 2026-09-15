@@ -48,6 +48,10 @@ audit_retention_days: 30
     host: 'localhost', username: 'agent', password: 'secret', database: 'auto_test', accessMode: 'read_write',
   });
   store.addConnection({
+    alias: 'unsafe-prod', datasourceId: 'unsafe', environment: 'prod', ownerScope: 'global', shareable: true,
+    host: 'localhost', username: 'writer', password: 'secret', database: 'unsafe_prod', accessMode: 'read_write',
+  });
+  store.addConnection({
     alias: 'proof-test', datasourceId: 'proofline', environment: 'test', ownerScope: 'workspace:auto-server',
     host: 'localhost', username: 'agent', password: 'secret', database: 'proof_test', accessMode: 'read_write',
   });
@@ -72,6 +76,14 @@ function operation(id: string, connection: string, domain = 'work_order') {
     id, domain, name: 'find', title: '查询详情', description: '查询固定详情。', useWhen: '按编号查询时使用。',
     connection, mode: 'read', exposure: 'domain', input: z.object({ id: z.string().min(1) }),
     sql: 'SELECT :id AS id LIMIT 1', maxRows: 1,
+  });
+}
+
+function writeOperation(id: string, connection: string) {
+  return defineBusinessOperation({
+    id, domain: 'work_order', name: 'mark', title: '更新状态', description: '更新固定状态。', useWhen: '更新状态时使用。',
+    connection, mode: 'update', exposure: 'domain', input: z.object({ id: z.string().min(1), status: z.string().min(1) }),
+    sql: 'UPDATE orders SET status = :status WHERE id = :id', maxAffectedRows: 1,
   });
 }
 
@@ -102,6 +114,7 @@ describe('workspace MCP tool surface', () => {
       operations: [
         operation('work_order.find.auto-dev', 'auto-dev'),
         operation('work_order.find.auto-prod', 'auto-prod'),
+        writeOperation('work_order.mark.auto-prod', 'auto-prod'),
         operation('proofline.find.proof-test', 'proof-test', 'proofline'),
       ],
     });
@@ -117,6 +130,7 @@ describe('workspace MCP tool surface', () => {
       'workspace_datasource_update', 'workspace_datasource_remove', 'workspace_validate',
     ]));
     expect(names).not.toEqual(expect.arrayContaining(['connection_add', 'connection_list', 'sql_execute__prod']));
+    expect(names).not.toContain('business__prod__work_order__write');
     for (const name of ['sql_query', 'sql_query__proofline', 'sql_query__prod', 'list_business_operations']) {
       const schema = tools.find((tool) => tool.name === name)?.inputSchema;
       expect(JSON.stringify(schema)).not.toContain('connection');
@@ -151,6 +165,12 @@ describe('workspace MCP tool surface', () => {
     });
     expect(unauthorized.isError).toBe(true);
     expect(unauthorized.structuredContent).toEqual(expect.objectContaining({ code: 'WORKSPACE_CONNECTION_NOT_AUTHORIZED' }));
+
+    const writableProd = await client.callTool({
+      name: 'workspace_datasource_bind', arguments: { datasource_id: 'unsafe', environment: 'prod', alias: 'unsafe-prod' },
+    });
+    expect(writableProd.isError).toBe(true);
+    expect(writableProd.structuredContent).toEqual(expect.objectContaining({ code: 'WORKSPACE_PROD_CONNECTION_NOT_READ_ONLY' }));
 
     const bound = await client.callTool({
       name: 'workspace_datasource_bind', arguments: { datasource_id: 'shared', environment: 'staging', alias: 'shared-stage' },
