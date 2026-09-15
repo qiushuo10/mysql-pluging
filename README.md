@@ -33,6 +33,8 @@
 - 通过固定的 `information_schema` 查询提供 Schema 搜索与局部关系描述。
 - 使用进程内 L1 与 SQLite L2 Schema 缓存减少重复元数据查询。
 - 从 YAML + SQL 加载版本化业务包，并生成按数据源和业务域隔离的工具。
+- 支持工作空间 descriptor、逻辑数据源/环境 binding，以及可热加载的 Business Pack v2 SQL + 受限脚本组合。
+- 为工作空间调用记录根 Trace、子步骤、使用统计和脱敏的高频 SQL 候选；每个数据源连接池上限为 2。
 - 提供不含密码、参数值、完整 SQL 和结果集的本地审计检索。
 - 同时返回 MCP `content` 与 `structuredContent`，兼容不同客户端的结果消费方式。
 
@@ -255,6 +257,7 @@ npm run test:live:autoserve
 - [协议与运行时设计](docs/protocol-and-runtime.md)
 - [技术方案](docs/technical-design.md)
 - [速度与稳定性架构评审](docs/speed-stability-review.md)
+- [业务脚本运行时与可观测闭环设计](docs/business-script-runtime-design.md)
 - [DSH 适配说明](adapters/dsh/README.md)
 
 ## 当前限制
