@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
@@ -38,6 +39,36 @@ interface WorkspaceTarget {
   policy: WorkspaceEnvironment;
   genericSuffix: string;
   identity: ConnectionIdentity;
+}
+
+interface TraceCursor {
+  startedAt: string;
+  runId: string;
+}
+
+function encodeTraceCursor(cursor: TraceCursor | null): string | null {
+  return cursor === null
+    ? null
+    : Buffer.from(JSON.stringify({ version: 1, started_at: cursor.startedAt, run_id: cursor.runId }), 'utf8').toString('base64url');
+}
+
+function decodeTraceCursor(value: string | undefined): TraceCursor | null {
+  if (value === undefined) return null;
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!decoded || typeof decoded !== 'object') throw new Error('not an object');
+    const cursor = decoded as { version?: unknown; started_at?: unknown; run_id?: unknown };
+    if (cursor.version !== 1 || typeof cursor.started_at !== 'string' || !Number.isFinite(Date.parse(cursor.started_at))
+      || typeof cursor.run_id !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(cursor.run_id)) {
+      throw new Error('invalid cursor fields');
+    }
+    return { startedAt: new Date(cursor.started_at).toISOString(), runId: cursor.run_id };
+  } catch (error) {
+    throw new PluginError({
+      category: 'argument_error', code: 'INVALID_TRACE_CURSOR', message: 'trace_search cursor 无效或版本不受支持。', cause: error,
+    });
+  }
 }
 
 function result(kind: string, data: Record<string, unknown>): CallToolResult {
@@ -693,13 +724,15 @@ export function registerWorkspaceTools(input: {
     inputSchema: workspaceTraceSearchSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, (args) => safe(() => {
+    const cursor = decodeTraceCursor(args.cursor);
     const found = input.store.searchExecutionRuns({
       workspaceId: input.manager.context.workspaceId, traceId: args.trace_id, runId: args.run_id,
       operationId: args.operation_id, operationKind: args.operation_kind, status: args.status,
       datasourceId: args.datasource_id, environment: args.environment,
       since: args.since ? new Date(args.since).toISOString() : undefined,
       until: args.until ? new Date(args.until).toISOString() : undefined,
-      beforeStartedAt: args.before_started_at ? new Date(args.before_started_at).toISOString() : undefined,
+      beforeStartedAt: cursor?.startedAt ?? (args.before_started_at ? new Date(args.before_started_at).toISOString() : undefined),
+      beforeRunId: cursor?.runId,
       limit: args.limit,
     });
     const records = found.records.map((run) => ({
@@ -718,7 +751,13 @@ export function registerWorkspaceTools(input: {
         error_category: span.errorCategory, result_bytes: span.resultBytes,
       })),
     }));
-    return result('trace_search', { record_count: records.length, records, next_before_started_at: found.nextBeforeStartedAt });
+    const nextCursor = found.nextBeforeStartedAt && found.nextBeforeRunId
+      ? encodeTraceCursor({ startedAt: found.nextBeforeStartedAt, runId: found.nextBeforeRunId })
+      : null;
+    return result('trace_search', {
+      record_count: records.length, records, next_cursor: nextCursor,
+      next_before_started_at: found.nextBeforeStartedAt,
+    });
   }));
 
   registerName(names, 'usage_summary');

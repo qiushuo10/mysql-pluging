@@ -117,6 +117,7 @@ export interface TraceSearchFilters {
   since?: string;
   until?: string;
   beforeStartedAt?: string;
+  beforeRunId?: string;
   limit: number;
 }
 

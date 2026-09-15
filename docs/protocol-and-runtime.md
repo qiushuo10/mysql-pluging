@@ -322,6 +322,8 @@ Registry 启动时要求每个 SQL 占位符对应一个必填属性：普通占
 
 `trace_search` 只检索当前 descriptor 的 `workspace_id`，支持按 trace、run、operation、kind、status、逻辑数据源、环境和时间过滤。返回 root 与 child span 摘要，但不返回物理连接 alias。`usage_summary` 在同一隔离边界内统计 count、error_count、p50/p95/p99、平均耗时和结果字节数，可按 operation、kind、datasource、environment 或 status 分组。
 
+Trace 分页使用返回的不可见实现细节游标 `next_cursor`，下一页原样传入 `cursor`。游标同时携带 `started_at + run_id`，因此同一毫秒内存在多条根调用时不会漏项；旧的 `before_started_at` 仍保留为兼容入口。只有通过 MCP 工具输入 Schema 校验并进入 handler 的调用才生成 `execution_run`；SDK 在 handler 之前拒绝的协议级 validation error 由宿主记录，不通过放宽工具 Schema 来伪造 application execution。
+
 Trace 表只保存标识、逻辑目标、版本/hash、耗时、排队时间、状态和有界结果字节数，不保存参数值、SQL 全文、查询结果、密码或凭据。workspace 启动时按 `audit_retention_days` 清理该 workspace 的过期 run/span；SQLite 外键级联删除 span，不触碰其他 workspace。详细导出仍为后续能力，清理前的导出与 hash 校验由调用方负责。
 
 ```json

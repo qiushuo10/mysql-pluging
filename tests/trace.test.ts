@@ -78,8 +78,9 @@ afterEach(() => {
 
 describe('trace identities and storage', () => {
   it('generates monotonic RFC 9562 UUIDv7 IDs and W3C-sized non-zero trace IDs', () => {
-    const first = uuidV7(1_800_000_000_000);
-    const second = uuidV7(1_800_000_000_000);
+    const timestamp = Date.now();
+    const first = uuidV7(timestamp);
+    const second = uuidV7(timestamp);
     expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(second > first).toBe(true);
 
@@ -237,6 +238,44 @@ describe('workspace trace tools', () => {
     expect(usage.structuredContent).toEqual(expect.objectContaining({ groups: [expect.objectContaining({
       group: 'all', count: 5, error_count: 1, p50_ms: 3, p95_ms: 100, p99_ms: 100, avg_ms: 22, result_bytes: 110,
     })] }));
+    await client.close();
+    await application.close();
+  });
+
+  it('paginates every run when 25 records share the same started_at', async () => {
+    const fixture = workspaceFixture('one');
+    const application = createMysqlMcpApplication({ stateHome: fixture.home, mode: 'workspace', workspacePath: fixture.descriptor, operations: [] });
+    const startedAt = '2026-09-15T00:00:00.000Z';
+    for (let index = 0; index < 25; index += 1) {
+      application.store.createExecutionRun(runRecord({
+        runId: uuidV7(), traceId: (index + 1).toString(16).padStart(32, '0'),
+        rootSpanId: (index + 1).toString(16).padStart(16, '0'), operationId: `page.${index}`, startedAt,
+      }));
+    }
+    const client = await clientFor(application);
+    const first = await client.callTool({ name: 'trace_search', arguments: { limit: 20 } });
+    const firstContent = first.structuredContent as { records: Array<{ run_id: string }>; next_cursor: string | null };
+    expect(firstContent.records).toHaveLength(20);
+    expect(firstContent.next_cursor).toEqual(expect.any(String));
+    const second = await client.callTool({ name: 'trace_search', arguments: { limit: 20, cursor: firstContent.next_cursor } });
+    const secondContent = second.structuredContent as { records: Array<{ run_id: string }>; next_cursor: string | null };
+    expect(secondContent.records).toHaveLength(5);
+    expect(secondContent.next_cursor).toBeNull();
+    const ids = [...firstContent.records, ...secondContent.records].map((record) => record.run_id);
+    expect(new Set(ids).size).toBe(25);
+    await client.close();
+    await application.close();
+  });
+
+  it('does not flip a successful business result when trace finalization fails', async () => {
+    const fixture = workspaceFixture();
+    const application = createMysqlMcpApplication({ stateHome: fixture.home, mode: 'workspace', workspacePath: fixture.descriptor, operations: [] });
+    application.service.query = async () => ({ status: 'ok', kind: 'query', rows: [], row_count: 0, connection: 'auto-test' });
+    application.store.finishExecutionRoot = () => { throw new Error('simulated trace finish failure'); };
+    const client = await clientFor(application);
+    const response = await client.callTool({ name: 'sql_query', arguments: { sql: 'SELECT 1 LIMIT 1' } });
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ status: 'ok', trace_id: expect.any(String), run_id: expect.any(String) }));
     await client.close();
     await application.close();
   });

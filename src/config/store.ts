@@ -961,7 +961,11 @@ export class StateStore {
     }
   }
 
-  searchExecutionRuns(filters: TraceSearchFilters): { records: ExecutionRunRecord[]; nextBeforeStartedAt: string | null } {
+  searchExecutionRuns(filters: TraceSearchFilters): {
+    records: ExecutionRunRecord[];
+    nextBeforeStartedAt: string | null;
+    nextBeforeRunId: string | null;
+  } {
     const clauses = ['workspace_id = ?'];
     const values: Array<string | number> = [filters.workspaceId];
     const add = (clause: string, value: string | number | undefined) => {
@@ -981,7 +985,12 @@ export class StateStore {
     add('environment = ?', filters.environment);
     add('started_at >= ?', filters.since);
     add('started_at <= ?', filters.until);
-    add('started_at < ?', filters.beforeStartedAt);
+    if (filters.beforeStartedAt !== undefined && filters.beforeRunId !== undefined) {
+      clauses.push('(started_at < ? OR (started_at = ? AND run_id < ?))');
+      values.push(filters.beforeStartedAt, filters.beforeStartedAt, filters.beforeRunId);
+    } else {
+      add('started_at < ?', filters.beforeStartedAt);
+    }
     const rows = this.database.prepare(`
       SELECT * FROM execution_runs WHERE ${clauses.join(' AND ')}
       ORDER BY started_at DESC, run_id DESC LIMIT ?
@@ -989,7 +998,12 @@ export class StateStore {
     const hasMore = rows.length > filters.limit;
     const selected = hasMore ? rows.slice(0, filters.limit) : rows;
     const records = selected.map((row) => this.executionRunFromRow(row));
-    return { records, nextBeforeStartedAt: hasMore && records.length > 0 ? records.at(-1)!.startedAt : null };
+    const last = hasMore && records.length > 0 ? records.at(-1)! : null;
+    return {
+      records,
+      nextBeforeStartedAt: last?.startedAt ?? null,
+      nextBeforeRunId: last?.runId ?? null,
+    };
   }
 
   listExecutionSpans(workspaceId: string, runId: string): ExecutionSpanRecord[] {

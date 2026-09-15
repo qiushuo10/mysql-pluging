@@ -269,10 +269,13 @@ export const workspaceTraceSearchSchema = z.object({
   environment: environment.optional(),
   since: auditTimestamp.optional(),
   until: auditTimestamp.optional(),
+  cursor: z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/, 'cursor 无效').optional(),
   before_started_at: auditTimestamp.optional(),
   limit: z.number().int().min(1).max(100).default(20),
 }).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
   message: 'since 不能晚于 until', path: ['since'],
+}).refine((input) => !input.cursor || !input.before_started_at, {
+  message: 'cursor 与 before_started_at 不能同时提供', path: ['cursor'],
 });
 
 export const workspaceUsageSummarySchema = z.object({
