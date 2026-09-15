@@ -288,6 +288,22 @@ export class StateStore {
         }
         this.recordMigration(6);
       }
+      if (current < 7) {
+        const auditColumns = this.database.prepare('PRAGMA table_info(execution_audit)').all() as Array<{ name: string }>;
+        const names = new Set(auditColumns.map((column) => column.name));
+        if (auditColumns.length > 0) {
+          if (!names.has('workspace_id')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN workspace_id TEXT');
+          if (!names.has('datasource_id')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN datasource_id TEXT');
+          if (!names.has('environment')) this.database.exec('ALTER TABLE execution_audit ADD COLUMN environment TEXT');
+          this.database.exec(`
+            CREATE INDEX IF NOT EXISTS idx_execution_audit_workspace
+              ON execution_audit(workspace_id, occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_execution_audit_workspace_target
+              ON execution_audit(workspace_id, datasource_id, environment, occurred_at DESC);
+          `);
+        }
+        this.recordMigration(7);
+      }
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -572,17 +588,21 @@ export class StateStore {
       .prepare(`
         INSERT INTO execution_audit (
           execution_id, occurred_at, client_name, connection_alias,
+          workspace_id, datasource_id, environment,
           business_operation_id, business_pack_id, business_pack_version,
           business_operation_hash, statement_kind, sql_hash, duration_ms,
           row_count, affected_rows, attempt_count, write_outcome, status,
           error_category, mysql_error_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         record.executionId,
         record.occurredAt,
         record.clientName,
         record.connectionAlias,
+        record.workspaceId ?? null,
+        record.datasourceId ?? null,
+        record.environment ?? null,
         record.businessOperationId,
         record.businessPackId,
         record.businessPackVersion,
@@ -610,6 +630,9 @@ export class StateStore {
     };
     add('execution_id = ?', filters.executionId);
     add('connection_alias = ?', filters.connectionAlias);
+    add('workspace_id = ?', filters.workspaceId);
+    add('datasource_id = ?', filters.datasourceId);
+    add('environment = ?', filters.environment);
     add('business_operation_id = ?', filters.businessOperationId);
     add('client_name = ?', filters.clientName);
     add('statement_kind = ?', filters.statementKind);
@@ -631,6 +654,9 @@ export class StateStore {
       occurredAt: String(row.occurred_at),
       clientName: String(row.client_name),
       connectionAlias: String(row.connection_alias),
+      workspaceId: row.workspace_id === null ? null : String(row.workspace_id),
+      datasourceId: row.datasource_id === null ? null : String(row.datasource_id),
+      environment: row.environment === null ? null : String(row.environment) as ConnectionEnvironment,
       businessOperationId: row.business_operation_id === null ? null : String(row.business_operation_id),
       businessPackId: row.business_pack_id === null ? null : String(row.business_pack_id),
       businessPackVersion: row.business_pack_version === null ? null : String(row.business_pack_version),

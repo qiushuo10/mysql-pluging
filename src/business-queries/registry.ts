@@ -7,6 +7,7 @@ import type { MysqlService } from '../mysql/service.js';
 import { compileNamedParameters, discoverNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
 import type { SqlParameters, SqlScalar } from '../types.js';
+import type { ConnectionEnvironment } from '../types.js';
 import type { BusinessOperation } from './definition.js';
 
 export class BusinessOperationRegistry {
@@ -119,6 +120,10 @@ export class BusinessOperationRegistry {
     return this.operations.filter((operation) => operation.exposure === 'direct');
   }
 
+  all(): readonly BusinessOperation[] {
+    return this.operations;
+  }
+
   grouped(): Array<{ toolName: string; connection: string; domain: string; lane: 'read' | 'write'; operations: BusinessOperation[] }> {
     const groups = new Map<string, BusinessOperation[]>();
     for (const operation of this.operations.filter((item) => item.exposure === 'domain')) {
@@ -140,6 +145,7 @@ export class BusinessOperationRegistry {
     service: MysqlService,
     signal?: AbortSignal,
     clientName?: string,
+    executionContext?: { workspaceId: string; datasourceId: string; environment: ConnectionEnvironment },
   ): Promise<Record<string, unknown>> {
     const parameters = parseBusinessParameters(operation, input);
     if (operation.mode === 'read') {
@@ -156,6 +162,9 @@ export class BusinessOperationRegistry {
         retrySafeAfterSend: operation.retrySafe ?? false,
         requestSignal: signal,
         clientName,
+        workspaceId: executionContext?.workspaceId,
+        datasourceId: executionContext?.datasourceId,
+        environment: executionContext?.environment,
       });
     }
     return service.execute({
@@ -171,6 +180,9 @@ export class BusinessOperationRegistry {
       expectedMode: operation.mode,
       requestSignal: signal,
       clientName,
+      workspaceId: executionContext?.workspaceId,
+      datasourceId: executionContext?.datasourceId,
+      environment: executionContext?.environment,
     });
   }
 }

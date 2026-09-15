@@ -14,6 +14,8 @@ import { StateStore } from '../config/store.js';
 import { PluginError, unknownError } from '../errors.js';
 import { MysqlService } from '../mysql/service.js';
 import type { SchemaSnapshotLoader } from '../mysql/schema.js';
+import { WorkspaceManager, type RuntimeMode } from '../workspace/context.js';
+import { registerWorkspaceTools } from './workspace-tools.js';
 import {
   connectionAddSchema,
   connectionListSchema,
@@ -161,7 +163,13 @@ async function invalidateRuntimeBestEffort(service: MysqlService, alias: string)
   }
 }
 
-function registerBaseTools(server: McpServer, store: StateStore, service: MysqlService, registry: BusinessOperationRegistry): void {
+function registerBaseTools(
+  server: McpServer,
+  store: StateStore,
+  service: MysqlService,
+  registry: BusinessOperationRegistry,
+  mode: 'admin' | 'global',
+): void {
   server.registerTool(
     'connection_add',
     {
@@ -265,6 +273,8 @@ function registerBaseTools(server: McpServer, store: StateStore, service: MysqlS
         return success(`已删除数据源 ${args.alias}。`, connectionResult('remove', { alias: args.alias, removed: true }));
       }),
   );
+
+  if (mode === 'admin') return;
 
   server.registerTool(
     'history_search',
@@ -513,6 +523,8 @@ export interface MysqlMcpApplication {
   businessRegistry: BusinessOperationRegistry;
   businessPacksHome: string | null;
   businessPacks: readonly LoadedBusinessPack[];
+  mode: RuntimeMode;
+  workspaceManager: WorkspaceManager | null;
   close(): Promise<void>;
 }
 
@@ -521,16 +533,38 @@ export function createMysqlMcpApplication(options: {
   operations?: readonly BusinessOperation[];
   businessPacksHome?: string;
   schemaLoader?: SchemaSnapshotLoader;
+  mode?: RuntimeMode;
+  workspacePath?: string;
 } = {}): MysqlMcpApplication {
+  const mode = options.mode ?? 'global';
+  if (mode === 'workspace' && !options.workspacePath) {
+    throw new PluginError({ category: 'config_error', code: 'WORKSPACE_DESCRIPTOR_REQUIRED', message: 'workspace 模式必须显式提供 workspacePath。' });
+  }
+  const workspaceManager = mode === 'workspace' ? new WorkspaceManager(options.workspacePath!) : null;
+  const workspaceLoads = workspaceManager && !options.operations
+    ? workspaceManager.context.businessPackPaths.map((path) => loadBusinessOperations(path))
+    : [];
   const loaded = options.operations
     ? { operations: options.operations, packs: [] as const, home: null }
-    : loadBusinessOperations(options.businessPacksHome);
+    : workspaceManager
+      ? {
+          operations: workspaceLoads.flatMap((item) => [...item.operations]),
+          packs: workspaceLoads.flatMap((item) => [...item.packs]),
+          home: workspaceManager.context.businessPackPaths[0] ?? null,
+        }
+      : mode === 'admin'
+        ? { operations: [] as readonly BusinessOperation[], packs: [] as const, home: null }
+        : loadBusinessOperations(options.businessPacksHome);
   const businessRegistry = new BusinessOperationRegistry(loaded.operations);
   const store = new StateStore(options.stateHome);
   const service = new MysqlService(store, undefined, options.schemaLoader);
-  const server = new McpServer({ name: 'mysql-agent', version: '0.2.4' });
-  registerBaseTools(server, store, service, businessRegistry);
-  registerBusinessTools(server, service, businessRegistry);
+  const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
+  if (workspaceManager) {
+    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server) });
+  } else {
+    registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
+    if (mode === 'global') registerBusinessTools(server, service, businessRegistry);
+  }
   return {
     server,
     store,
@@ -538,6 +572,8 @@ export function createMysqlMcpApplication(options: {
     businessRegistry,
     businessPacksHome: loaded.home,
     businessPacks: loaded.packs,
+    mode,
+    workspaceManager,
     close: () => service.close(),
   };
 }

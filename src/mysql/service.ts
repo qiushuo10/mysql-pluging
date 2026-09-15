@@ -24,6 +24,9 @@ export interface QueryRequest {
   retrySafeAfterSend?: boolean;
   requestSignal?: AbortSignal;
   clientName?: string;
+  workspaceId?: string;
+  datasourceId?: string;
+  environment?: ConnectionConfig['environment'];
 }
 
 export interface WriteRequest extends Omit<QueryRequest, 'maxRows' | 'retrySafeAfterSend'> {
@@ -141,6 +144,9 @@ export class MysqlService {
         businessPackId: request.businessPackId,
         businessPackVersion: request.businessPackVersion,
         businessOperationHash: request.businessOperationHash,
+        workspaceId: request.workspaceId,
+        datasourceId: request.datasourceId,
+        environment: request.environment,
         statementKind: validation.kind,
         sqlHash,
         durationMs,
@@ -241,6 +247,9 @@ export class MysqlService {
         businessPackId: request.businessPackId,
         businessPackVersion: request.businessPackVersion,
         businessOperationHash: request.businessOperationHash,
+        workspaceId: request.workspaceId,
+        datasourceId: request.datasourceId,
+        environment: request.environment,
         statementKind: kind,
         sqlHash,
         durationMs,
@@ -334,6 +343,9 @@ export class MysqlService {
     status: 'ok' | 'error';
     errorCategory?: string;
     mysqlErrorCode?: number | null;
+    workspaceId?: string;
+    datasourceId?: string;
+    environment?: ConnectionConfig['environment'];
   }): void {
     try {
       this.store.recordAudit({
@@ -341,6 +353,9 @@ export class MysqlService {
         occurredAt: new Date().toISOString(),
         clientName: input.clientName ?? 'unknown',
         connectionAlias: input.config.alias,
+        workspaceId: input.workspaceId ?? null,
+        datasourceId: input.datasourceId ?? input.config.datasourceId ?? null,
+        environment: input.environment ?? input.config.environment ?? null,
         businessOperationId: input.businessOperationId ?? null,
         businessPackId: input.businessPackId ?? null,
         businessPackVersion: input.businessPackVersion ?? null,
@@ -381,6 +396,9 @@ export class MysqlService {
       businessPackId: request.businessPackId,
       businessPackVersion: request.businessPackVersion,
       businessOperationHash: request.businessOperationHash,
+      workspaceId: request.workspaceId,
+      datasourceId: request.datasourceId,
+      environment: request.environment,
       statementKind,
       sqlHash,
       durationMs,

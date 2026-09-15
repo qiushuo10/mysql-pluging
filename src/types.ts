@@ -36,6 +36,9 @@ export interface AuditRecord {
   occurredAt: string;
   clientName: string;
   connectionAlias: string;
+  workspaceId?: string | null;
+  datasourceId?: string | null;
+  environment?: ConnectionEnvironment | null;
   businessOperationId: string | null;
   businessPackId: string | null;
   businessPackVersion: string | null;
@@ -59,6 +62,9 @@ export interface AuditHistoryRecord extends AuditRecord {
 export interface AuditHistoryFilters {
   executionId?: string;
   connectionAlias?: string;
+  workspaceId?: string;
+  datasourceId?: string;
+  environment?: ConnectionEnvironment;
   businessOperationId?: string;
   clientName?: string;
   statementKind?: string;

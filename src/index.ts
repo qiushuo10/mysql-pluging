@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 
 import { SHUTDOWN_TIMEOUT_MS } from './constants.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from './mcp/server.js';
+import { parseRuntimeOptions } from './workspace/context.js';
 
 let application: MysqlMcpApplication | undefined;
 let closing = false;
@@ -23,7 +24,8 @@ process.once('SIGINT', () => void shutdown(0));
 process.once('SIGTERM', () => void shutdown(0));
 
 try {
-  application = createMysqlMcpApplication();
+  const runtime = parseRuntimeOptions(process.argv.slice(2));
+  application = createMysqlMcpApplication({ mode: runtime.mode, workspacePath: runtime.workspacePath });
   const transport = new StdioServerTransport();
   application.server.server.onclose = () => {
     void shutdown();

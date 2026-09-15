@@ -148,6 +148,72 @@ export const listBusinessOperationsSchema = z
   })
   .strict();
 
+export const workspaceSqlQuerySchema = sqlQuerySchema.omit({ connection: true });
+export const workspaceSqlExecuteSchema = sqlExecuteSchema.omit({ connection: true });
+export const workspaceSchemaSearchSchema = schemaSearchSchema.omit({ connection: true });
+export const workspaceSchemaDescribeSchema = schemaDescribeSchema.omit({ connection: true });
+export const workspaceListBusinessOperationsSchema = listBusinessOperationsSchema.omit({ connection: true });
+
+const workspaceDatasourceIdentity = {
+  datasource_id: datasourceId,
+  environment,
+};
+
+export const workspaceDatasourceAddSchema = z.object({
+  ...workspaceDatasourceIdentity,
+  alias,
+  description: connectionFields.description,
+  host: connectionFields.host,
+  port: connectionFields.port,
+  username: connectionFields.username,
+  password: connectionFields.password,
+  database: connectionFields.database,
+  allowed_databases: connectionFields.allowed_databases,
+  charset: connectionFields.charset,
+  access_mode: z.enum(['read_only', 'read_write']).default('read_write'),
+  connect_timeout_ms: connectionFields.connect_timeout_ms,
+  query_timeout_ms: connectionFields.query_timeout_ms,
+  pool_max: connectionFields.pool_max,
+  idle_timeout_ms: connectionFields.idle_timeout_ms,
+  enabled: connectionFields.enabled,
+  make_default: z.boolean().default(false),
+}).strict();
+
+export const workspaceDatasourceBindSchema = z.object({
+  ...workspaceDatasourceIdentity,
+  alias,
+  make_default: z.boolean().default(false),
+}).strict();
+
+export const workspaceDatasourceListSchema = z.object({}).strict();
+
+export const workspaceDatasourceUpdateSchema = z.object({
+  ...workspaceDatasourceIdentity,
+  description: connectionFields.description,
+  host: connectionFields.host.optional(),
+  port: connectionFields.port.optional(),
+  username: connectionFields.username.optional(),
+  password: connectionFields.password.optional(),
+  database: connectionFields.database.optional(),
+  allowed_databases: connectionFields.allowed_databases,
+  charset: z.literal('utf8mb4').optional(),
+  access_mode: z.enum(['read_only', 'read_write']).optional(),
+  connect_timeout_ms: z.number().int().min(1_000).max(30_000).optional(),
+  query_timeout_ms: z.number().int().min(100).max(300_000).optional(),
+  pool_max: z.number().int().min(1).max(MAX_POOL_MAX).optional(),
+  idle_timeout_ms: z.number().int().min(10_000).max(600_000).optional(),
+  enabled: z.boolean().optional(),
+}).strict().refine((input) => Object.keys(input).some((key) => key !== 'datasource_id' && key !== 'environment'), {
+  message: 'At least one connection field must be updated',
+});
+
+export const workspaceDatasourceRemoveSchema = z.object({
+  ...workspaceDatasourceIdentity,
+  delete_owned_connection: z.boolean().default(false),
+}).strict();
+
+export const workspaceValidateSchema = z.object({}).strict();
+
 const auditTimestamp = z.string().max(64).refine((value) => Number.isFinite(Date.parse(value)), {
   message: '必须是带时区的 ISO 8601 时间，例如 2026-08-27T10:00:00+08:00',
 });
@@ -170,3 +236,19 @@ export const historySearchSchema = z
     message: 'since 不能晚于 until',
     path: ['since'],
   });
+
+export const workspaceHistorySearchSchema = z.object({
+  execution_id: z.string().uuid().optional(),
+  business_operation_id: z.string().min(1).max(192).optional(),
+  client_name: z.string().min(1).max(64).optional(),
+  statement_kind: z.enum(['select', 'show', 'describe', 'explain', 'insert', 'update', 'delete', 'query', 'write']).optional(),
+  status: z.enum(['ok', 'error']).optional(),
+  since: auditTimestamp.optional(),
+  until: auditTimestamp.optional(),
+  before_id: z.number().int().positive().optional(),
+  limit: z.number().int().min(1).max(100).default(20),
+  datasource_id: datasourceId.optional(),
+  environment: environment.optional(),
+}).strict().refine((input) => !input.since || !input.until || Date.parse(input.since) <= Date.parse(input.until), {
+  message: 'since 不能晚于 until', path: ['since'],
+});
