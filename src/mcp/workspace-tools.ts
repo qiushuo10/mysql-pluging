@@ -458,9 +458,15 @@ function registerWorkspaceManagementTools(
     if (connection.ownerScope !== `workspace:${manager.context.workspaceId}`) {
       throw configError('WORKSPACE_CONNECTION_UPDATE_FORBIDDEN', `连接 ${alias} 不属于当前工作空间。`);
     }
+    const toolSurfaceChanged = (args.access_mode !== undefined && args.access_mode !== connection.accessMode)
+      || (args.enabled !== undefined && args.enabled !== connection.enabled);
     const summary = store.updateConnection(updateInput(args, alias));
     await invalidateRuntimeBestEffort(service, alias);
-    return result('workspace_datasource_update', { datasource_id: args.datasource_id, environment: args.environment, connection: summary, reconnect_required: false });
+    return result('workspace_datasource_update', {
+      datasource_id: args.datasource_id, environment: args.environment, connection: summary,
+      reconnect_required: toolSurfaceChanged,
+      reason: toolSurfaceChanged ? '访问模式或启用状态变化；请重新连接以刷新工具目录。' : null,
+    });
   }));
 
   addTool('workspace_datasource_remove');
