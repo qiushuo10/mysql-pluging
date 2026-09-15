@@ -229,7 +229,10 @@ function registerBoundDataTools(
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, (args, extra) => safe(async () => {
     const target = liveTarget(manager, store, initial);
-    const value = await service.schema.search({ connection: target.alias, keyword: args.keyword, limit: args.limit, refresh: args.refresh, requestSignal: extra.signal });
+    const value = await service.schema.search({
+      connection: target.alias, keyword: args.keyword, limit: args.limit, refresh: args.refresh,
+      requestSignal: extra.signal, expectedConnection: target.identity,
+    });
     return result('schema_search', publicWorkspaceResult(value, target));
   }));
 
@@ -244,7 +247,7 @@ function registerBoundDataTools(
     const value = await service.schema.describe({
       connection: target.alias, tables: args.tables, includeRelations: args.include_relations,
       relationDepth: args.relation_depth, includeInferredRelations: args.include_inferred_relations,
-      refresh: args.refresh, requestSignal: extra.signal,
+      refresh: args.refresh, requestSignal: extra.signal, expectedConnection: target.identity,
     });
     return result('schema_describe', publicWorkspaceResult(value, target));
   }));

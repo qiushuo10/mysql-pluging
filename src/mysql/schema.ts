@@ -17,7 +17,7 @@ import {
   SCHEMA_L1_TTL_MS,
   SCHEMA_L2_TTL_MS,
 } from '../constants.js';
-import { StateStore } from '../config/store.js';
+import { StateStore, type ConnectionIdentity } from '../config/store.js';
 import { PluginError, mapMysqlError } from '../errors.js';
 import type { ConnectionConfig } from '../types.js';
 import { createMetadataByteBudget, executeMetadataQueryAttempt } from './executor.js';
@@ -367,9 +367,10 @@ export class SchemaService {
     limit: number;
     refresh?: boolean;
     requestSignal?: AbortSignal;
+    expectedConnection?: ConnectionIdentity;
   }): Promise<Record<string, unknown>> {
     const started = performance.now();
-    const config = this.requireEnabledConnection(request.connection);
+    const config = this.requireEnabledConnection(request.connection, request.expectedConnection);
     const loaded = request.refresh === true
       ? await this.refreshSnapshot(config, request.requestSignal)
       : await this.getSnapshot(config, request.requestSignal);
@@ -404,9 +405,10 @@ export class SchemaService {
     includeInferredRelations: boolean;
     refresh?: boolean;
     requestSignal?: AbortSignal;
+    expectedConnection?: ConnectionIdentity;
   }): Promise<Record<string, unknown>> {
     const started = performance.now();
-    const config = this.requireEnabledConnection(request.connection);
+    const config = this.requireEnabledConnection(request.connection, request.expectedConnection);
     const requestedKeys = request.tables.map((identifier) => {
       const resolved = parseTableIdentifier(identifier, config);
       return tableKey(resolved.database, resolved.table);
@@ -654,8 +656,14 @@ export class SchemaService {
     }
   }
 
-  private requireEnabledConnection(alias: string): ConnectionConfig {
-    const config = this.store.requireConnection(alias);
+  private requireEnabledConnection(alias: string, expected?: ConnectionIdentity): ConnectionConfig {
+    if (expected && expected.alias !== alias) {
+      throw new PluginError({
+        category: 'permission_error', code: 'AUTH_TARGET_CHANGED',
+        message: 'Schema 请求连接与已验证的 workspace 目标不一致。', retryable: true,
+      });
+    }
+    const config = expected ? this.store.assertConnectionIdentity(expected) : this.store.requireConnection(alias);
     if (!config.enabled) {
       throw new PluginError({
         category: 'config_error',

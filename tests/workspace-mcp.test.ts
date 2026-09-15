@@ -258,4 +258,37 @@ describe('workspace MCP tool surface', () => {
     })).rejects.toMatchObject({ code: 'AUTH_TARGET_CHANGED' });
     await application.close();
   });
+
+  it('rejects schema search and describe when revision changes after target resolution', async () => {
+    const state = fixture();
+    let loaderCalls = 0;
+    const application = createMysqlMcpApplication({
+      stateHome: state.home, mode: 'workspace', workspacePath: state.descriptor, operations: [],
+      schemaLoader: async () => {
+        loaderCalls += 1;
+        return { tables: [], relations: [] };
+      },
+    });
+    const client = await connect(application);
+    const originalSearch = application.service.schema.search.bind(application.service.schema);
+    application.service.schema.search = async (request) => {
+      application.store.updateConnection({ alias: request.connection, description: 'changed after search resolution' });
+      return originalSearch(request);
+    };
+    const search = await client.callTool({ name: 'schema_search', arguments: {} });
+    expect(search.isError).toBe(true);
+    expect(search.structuredContent).toEqual(expect.objectContaining({ code: 'AUTH_TARGET_CHANGED' }));
+
+    const originalDescribe = application.service.schema.describe.bind(application.service.schema);
+    application.service.schema.describe = async (request) => {
+      application.store.updateConnection({ alias: request.connection, description: 'changed after describe resolution' });
+      return originalDescribe(request);
+    };
+    const describe = await client.callTool({ name: 'schema_describe', arguments: { tables: ['orders'] } });
+    expect(describe.isError).toBe(true);
+    expect(describe.structuredContent).toEqual(expect.objectContaining({ code: 'AUTH_TARGET_CHANGED' }));
+    expect(loaderCalls).toBe(0);
+    await client.close();
+    await application.close();
+  });
 });
