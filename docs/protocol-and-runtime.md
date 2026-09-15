@@ -183,6 +183,10 @@ SELECT * FROM orders WHERE id IN (:...ids)
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `alias` | string | 是 | - | 连接别名 |
+| `datasource_id` | string | 否 | `alias` | 稳定的数据源标识；格式与 `alias` 相同 |
+| `environment` | enum | 否 | `custom` | `dev`、`test`、`staging`、`prod` 或 `custom`；不根据 alias 推断 |
+| `owner_scope` | string | 否 | `global` | 数据源所有者范围 |
+| `shareable` | boolean | 否 | `false` | 是否允许后续工作区共享；当前版本只保存元数据 |
 | `description` | string | 否 | `null` | 给 Agent 看的用途说明 |
 | `host` | string | 是 | - | MySQL 地址 |
 | `port` | integer | 否 | `3306` | 1–65535 |
@@ -194,7 +198,7 @@ SELECT * FROM orders WHERE id IN (:...ids)
 | `access_mode` | enum | 否 | `read_write` | `read_only` 或 `read_write` |
 | `connect_timeout_ms` | integer | 否 | `5000` | 1000–30000 |
 | `query_timeout_ms` | integer | 否 | `30000` | 100–300000 |
-| `pool_max` | integer | 否 | `10` | 1–10；每个 MCP 进程内、每个数据源最多 10 条物理连接 |
+| `pool_max` | integer | 否 | `2` | 1–2；每个 MCP 进程内、每个数据源最多 2 条物理连接 |
 | `idle_timeout_ms` | integer | 否 | `60000` | 10000–600000 |
 | `enabled` | boolean | 否 | `true` | 是否允许调用 |
 
@@ -214,7 +218,7 @@ SELECT * FROM orders WHERE id IN (:...ids)
 | --- | --- | --- | --- | --- |
 | `include_disabled` | boolean | 否 | `true` | 是否返回停用连接 |
 
-返回字段：`alias`、`description`、`host`、`port`、`username`、`database`、`allowed_databases`、`access_mode`、超时、池大小、`enabled`、`revision`、更新时间。永不返回密码。
+返回字段：`alias`、`datasourceId`、`environment`、`ownerScope`、`shareable`、`description`、`host`、`port`、`username`、`database`、`allowedDatabases`、`accessMode`、超时、池大小、`enabled`、`revision` 和时间戳。永不返回密码。
 
 ### 4.4 `connection_remove`
 
@@ -511,13 +515,13 @@ ConnectionRuntime:
 }
 ```
 
-`poolMax` 默认且最大为 10。连接池按需创建物理连接，启动时不会一次建立 10 条；空闲时最多保留 2 条热连接。Cockatiel bulkhead 对同一数据源允许 10 个调用执行、40 个调用排队，排队最多等待 1000 ms。
+`poolMax` 默认且最大为 2。连接池按需创建物理连接，启动时不会预建连接；空闲时最多保留 2 条热连接。Cockatiel bulkhead 对同一数据源允许 2 个调用执行、8 个调用排队，排队最多等待 1000 ms。
 
 执行过程：
 
 1. 调用从池中借一条连接。
 2. 池优先返回空闲连接；没有空闲连接时，在 `pool_max` 范围内新建物理连接。
-3. 达到上限后，后续调用在 Cockatiel bulkhead 中进入有界等待队列；第 51 个并发调用或排队超过 1000 ms 时返回 `busy`。
+3. 达到上限后，后续调用在 Cockatiel bulkhead 中进入有界等待队列；第 11 个并发调用或排队超过 1000 ms 时返回 `busy`。
 4. 执行成功后在 `finally` 中释放连接，供后续 Agent 调用复用。
 5. 致命连接错误或客户端超时会销毁当前连接，不放回池中。
 6. 超过 `idle_timeout_ms` 的空闲连接由池释放；逻辑池继续存在，下一次调用按需重建物理连接。
@@ -754,8 +758,8 @@ sequenceDiagram
 - 相同进程、相同连接别名：共享一个连接池。
 - 相同进程、不同连接别名：使用不同连接池。
 - Codex 进程与 DSH 进程：各自维护连接池，共享 SQLite。
-- 同一别名默认且最多建立 10 条物理连接；物理连接按需建立，不在启动时预建 10 条。
-- Cockatiel bulkhead 最多允许 10 个调用执行、40 个调用排队，防止无限排队。
+- 同一别名默认且最多建立 2 条物理连接；物理连接按需建立，不在启动时预建。
+- Cockatiel bulkhead 最多允许 2 个调用执行、8 个调用排队，防止无限排队。
 - SQLite 使用 WAL、`busy_timeout=5000` 和短事务。
 - 审计通过 Cockatiel bulkhead 串行写入并限制等待数量；关键配置写入不经过异步队列。
 
@@ -811,7 +815,7 @@ sequenceDiagram
 12. 所有工具结果和日志均不泄露密码与参数值。
 13. BIGINT、DECIMAL 和日期时间序列化结果稳定。
 14. 多语句、跨库、无 `WHERE` 更新和删除全部被拒绝。
-15. 对单一数据源发起 60 个并发请求，验证最多 10 个执行、40 个排队，其余快速返回 `busy`，且物理连接数不超过 10。
+15. 对单一数据源发起 60 个并发请求，验证最多 2 个执行、8 个排队，其余 50 个快速返回 `busy`，且物理连接数不超过 2。
 
 ## 17. 依据
 

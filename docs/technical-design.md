@@ -184,6 +184,10 @@ CREATE TABLE schema_migrations (
 
 CREATE TABLE connections (
   alias TEXT PRIMARY KEY,
+  datasource_id TEXT,
+  environment TEXT NOT NULL DEFAULT 'custom',
+  owner_scope TEXT NOT NULL DEFAULT 'global',
+  shareable INTEGER NOT NULL DEFAULT 0,
   description TEXT,
   host TEXT NOT NULL,
   port INTEGER NOT NULL DEFAULT 3306,
@@ -195,7 +199,7 @@ CREATE TABLE connections (
   access_mode TEXT NOT NULL DEFAULT 'read_write',
   connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
   query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-  pool_max INTEGER NOT NULL DEFAULT 10,
+  pool_max INTEGER NOT NULL DEFAULT 2,
   idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
   enabled INTEGER NOT NULL DEFAULT 1,
   revision INTEGER NOT NULL DEFAULT 1,
@@ -234,6 +238,8 @@ CREATE TABLE schema_snapshots (
 );
 ```
 
+`datasource_id` 在存储层允许为空，仅用于兼容仍按 v4 列表执行 `INSERT` 的旧进程。v5 的 `AFTER INSERT` 触发器在同一事务内把空值回填为 `alias`，并把旧进程写入的过大 `pool_max` 限制为 2；新版本读取时也把空值解释为 `alias`。`environment`、`owner_scope` 和 `shareable` 依靠 SQLite 默认值兼容旧写入。
+
 默认审计不保存密码、绑定参数值、完整 SQL或查询结果。临时 SQL 只保存规范化 hash；业务操作还保存 `business_operation_id`、业务包 ID、版本和操作 hash。`history_search` 只检索这些摘要，不能回放旧结果。
 
 ### 6.3 配置体验
@@ -247,7 +253,7 @@ connection_list()
 connection_remove(alias)
 ```
 
-`connection_add` 和 `connection_update` 接收密码并写入 SQLite，但任何工具结果都不能返回密码。`connection_list` 只返回别名、描述、地址、用户名、默认数据库、访问模式和启用状态。
+`connection_add` 和 `connection_update` 接收密码并写入 SQLite，但任何工具结果都不能返回密码。`connection_list` 返回连接信息及非敏感元数据 `datasourceId`、`environment`、`ownerScope`、`shareable`，不返回密码。
 
 采用这种入口后，密码会经过模型输入、MCP 工具参数和宿主调用轨迹。当前产品边界接受测试环境密码的这一风险；SQLite 明文存储并不能消除传输和轨迹中的暴露。
 
@@ -255,7 +261,7 @@ connection_remove(alias)
 
 SQLite 使用 WAL、`busy_timeout` 和短事务。Codex 与 DSH 同时运行时可以共享连接配置；连接配置更新后，MCP Server 通过 revision 失效对应连接池。
 
-状态迁移在 `BEGIN IMMEDIATE` 内按 v1、v2、v3 顺序执行，支持旧 v1/v2 原地升级和重复启动；检测到高于当前实现的 migration 版本时失败关闭，不尝试降级读取。
+状态迁移在 `BEGIN IMMEDIATE` 内按版本顺序执行，支持旧状态库原地升级和重复启动。v5 将 `pool_max` 限制为 2，补充数据源元数据，并保留旧版本进程的连接写入兼容。检测到高于当前实现的 migration 版本时失败关闭，不尝试降级读取。
 
 ### 6.4 Schema 快照生命周期
 
@@ -472,7 +478,7 @@ internal_error
 ## 9. 性能设计
 
 1. MCP Server 是常驻进程，不为每次查询启动 Python 或 Node 进程。
-2. 每个连接别名维护独立、懒加载的 `mysql2` 连接池；每个池最多建立 10 条物理连接。
+2. 每个连接别名维护独立、懒加载的 `mysql2` 连接池；每个池最多建立 2 条物理连接，另有 8 个有界等待位置。
 3. 配置变化只关闭受影响的池，不重建全部连接。
 4. 业务操作定义在启动时注册，不在每次调用时重新解析配置文件。
 5. 使用服务端参数绑定，不进行字符串拼接。

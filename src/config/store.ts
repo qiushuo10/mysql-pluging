@@ -140,7 +140,7 @@ export class StateStore {
         this.database.exec(`
         CREATE TABLE IF NOT EXISTS connections (
           alias TEXT PRIMARY KEY,
-          datasource_id TEXT NOT NULL,
+          datasource_id TEXT,
           environment TEXT NOT NULL DEFAULT 'custom',
           owner_scope TEXT NOT NULL DEFAULT 'global',
           shareable INTEGER NOT NULL DEFAULT 0,
@@ -274,7 +274,7 @@ export class StateStore {
             this.database.exec(`
               CREATE TABLE _connections_v5_rebuild (
                 alias TEXT PRIMARY KEY,
-                datasource_id TEXT NOT NULL,
+                datasource_id TEXT,
                 environment TEXT NOT NULL DEFAULT 'custom',
                 owner_scope TEXT NOT NULL DEFAULT 'global',
                 shareable INTEGER NOT NULL DEFAULT 0,
@@ -314,6 +314,27 @@ export class StateStore {
               ALTER TABLE _connections_v5_rebuild RENAME TO connections;
             `);
           }
+          this.database.exec(`
+            CREATE TRIGGER IF NOT EXISTS trg_connections_v5_insert_defaults
+            AFTER INSERT ON connections
+            WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' OR NEW.pool_max > ${MAX_POOL_MAX}
+            BEGIN
+              UPDATE connections
+              SET datasource_id = CASE
+                    WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' THEN NEW.alias
+                    ELSE NEW.datasource_id
+                  END,
+                  pool_max = MIN(NEW.pool_max, ${MAX_POOL_MAX})
+              WHERE alias = NEW.alias;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_connections_v5_pool_cap
+            AFTER UPDATE OF pool_max ON connections
+            WHEN NEW.pool_max > ${MAX_POOL_MAX}
+            BEGIN
+              UPDATE connections SET pool_max = ${MAX_POOL_MAX} WHERE alias = NEW.alias;
+            END;
+          `);
         }
         this.recordMigration(5);
       }

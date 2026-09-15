@@ -239,6 +239,26 @@ describe('StateStore', () => {
 
     const second = new StateStore(home);
     expect(second.requireConnection('legacy-prod').revision).toBe(8);
+    const oldProcess = new DatabaseSync(path);
+    oldProcess.prepare(`
+      INSERT INTO connections (
+        alias, description, host, port, username, password, default_database,
+        allowed_databases_json, charset, access_mode, connect_timeout_ms,
+        query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(
+      'legacy-late', null, 'localhost', 3306, 'agent', 'secret', 'app', '["app"]',
+      'utf8mb4', 'read_write', 5000, 30000, 10, 60000, 1, 'old', 'old',
+    );
+    expect(oldProcess.prepare('SELECT datasource_id, environment, owner_scope, shareable, pool_max FROM connections WHERE alias = ?')
+      .get('legacy-late')).toEqual({
+      datasource_id: 'legacy-late', environment: 'custom', owner_scope: 'global', shareable: 0, pool_max: 2,
+    });
+    oldProcess.close();
+    expect(second.requireConnection('legacy-late')).toEqual(expect.objectContaining({
+      datasourceId: 'legacy-late', environment: 'custom', ownerScope: 'global', shareable: false, poolMax: 2,
+    }));
     const inspect = new DatabaseSync(path);
     expect((inspect.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }).version).toBe(STATE_SCHEMA_VERSION);
     expect((inspect.prepare('PRAGMA table_info(connections)').all() as Array<{ name: string; dflt_value: string | null }>)

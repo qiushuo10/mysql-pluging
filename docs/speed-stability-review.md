@@ -33,12 +33,12 @@ queueLimit: poolMax * 4
 ```ts
 mysql2 pool:
   waitForConnections: false
-  connectionLimit: 10
+  connectionLimit: 2
   queueLimit: 0
 
 Cockatiel bulkhead:
-  concurrency: 10
-  queue: 40
+  concurrency: 2
+  queue: 8
   queue_timeout_ms: 1000
 ```
 
@@ -98,10 +98,10 @@ DSH 当前的 MCP Client 会为一个插件实例维护一个受监督的 stdio 
 
 推荐第一版继续使用 stdio，不先增加本地 daemon；同时：
 
-- 每个数据源的 `pool_max` 默认且最大为 10。
-- 物理连接按需建立，启动时不预建 10 条；默认 `maxIdle` 为 2，`idleTimeout` 为 60 秒。
+- 每个数据源的 `pool_max` 默认且最大为 2。
+- 物理连接按需建立，启动时不预建连接；默认 `maxIdle` 为 2，`idleTimeout` 为 60 秒。
 - 在 Codex 同时启动 1、5、10 个任务时实测 MCP 进程数和 MySQL 连接数。
-- 如果多个 MCP 进程使同一数据源的总连接数超过测试库预算，再升级为单一本地 daemon + Unix socket/Streamable HTTP，在整台机器上共享同一个 10 连接池。
+- 如果多个 MCP 进程使同一数据源的总连接数超过测试库预算，再升级为单一本地 daemon + Unix socket/Streamable HTTP，在整台机器上共享同一个 2 连接池。
 
 ### 2.6 一个子进程可以承接并发请求，但必须有界
 
@@ -112,16 +112,16 @@ DSH 当前的 MCP Client 会为一个插件实例维护一个受监督的 stdio 
 每个连接别名单独维护：
 
 ```text
-active = pool_max = 10
-queued = pool_max * 4 = 40
+active = pool_max = 2
+queued = pool_max * 4 = 8
 queue_timeout_ms = 1000
 ```
 
 处理规则：
 
-1. 前 10 个请求进入 MySQL 执行。
-2. 后 40 个请求在 Cockatiel 中按 FIFO 等待。
-3. 第 51 个及以后的请求立即返回 `busy`；已排队请求等待超过 1 秒也返回 `busy`。
+1. 前 2 个请求进入 MySQL 执行。
+2. 后 8 个请求在 Cockatiel 中按 FIFO 等待。
+3. 第 11 个及以后的请求立即返回 `busy`；已排队请求等待超过 1 秒也返回 `busy`。
 4. `busy` 不触发熔断，不自动扩容连接池，也不自动启动新子进程。
 5. 读取可依据 `retry_after_ms` 由 Agent 决定是否重试；写入不能因为 `busy` 之外的未知结果自动重试。
 6. 不同连接别名使用独立 bulkhead 和连接池，避免一个慢库占满所有数据库执行槽位。
@@ -226,7 +226,7 @@ Agent 可能生成大量结构不同的临时 SQL。`mysql2.execute()` 会按物
 8. MCP 子进程连续崩溃 10 次时，DSH 按有界退避重启且不产生重叠子进程。
 9. 日志、MCP 结果和 SQLite history 均不记录密码或参数值。
 10. 使用 100 条真实目标库 SQL 验证 parser；无法识别的 SQL 全部失败关闭。
-11. 对单一连接别名发起 60 个并发请求，验证最多 10 个执行、40 个排队，其余快速返回 `busy`，且物理连接数不超过 10。
+11. 对单一连接别名发起 60 个并发请求，验证最多 2 个执行、8 个排队，其余 50 个快速返回 `busy`，且物理连接数不超过 2。
 12. 使用 30、60、100 个业务操作做工具选择基准，验证模型不会把相近 operation 或读写入口选错。
 
 ## 7. 架构冻结建议
