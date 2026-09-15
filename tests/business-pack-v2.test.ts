@@ -229,6 +229,10 @@ describe('business pack v2', () => {
     ['timeout', 'MYSQL_QUERY_TIMEOUT', true],
   ] as const)('preserves safe host PluginError semantics for %s', async (category, code, retryable) => {
     const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      const input = await workflow.input();
+      return operations.call('order.find', input);
+    `);
     const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
     app.service.query = async () => {
       throw new PluginError({
@@ -244,7 +248,32 @@ describe('business pack v2', () => {
     await client.close(); await app.close();
   });
 
-  it('selects the lowest script step deterministically when concurrent host calls fail', async () => {
+  it.each([
+    ['argument_error', 'FIRST_CAUGHT', 'permission_error', 'SECOND_UNHANDLED'],
+    ['permission_error', 'FIRST_CAUGHT', 'argument_error', 'SECOND_UNHANDLED'],
+  ] as const)('does not misattribute a caught %s failure when a later %s failure escapes', async (firstCategory, firstCode, secondCategory, secondCode) => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      const input = await workflow.input();
+      try { await operations.call('order.find', input); } catch {}
+      return operations.call('proof.find', input);
+    `);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async (request) => {
+      if (request.businessOperationId === 'order.find') {
+        throw new PluginError({ category: firstCategory, code: firstCode, message: 'secret caught error' });
+      }
+      throw new PluginError({ category: secondCategory, code: secondCode, message: 'secret unhandled error' });
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'internal_error', code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(JSON.stringify(response)).not.toMatch(/FIRST_CAUGHT|SECOND_UNHANDLED|secret caught|secret unhandled/);
+    await client.close(); await app.close();
+  });
+
+  it('returns a generic error instead of guessing between concurrent host failures', async () => {
     const state = fixture();
     const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
     app.service.query = async (request) => {
@@ -256,8 +285,9 @@ describe('business pack v2', () => {
     };
     const client = await connect(app);
     const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
-    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'argument_error', code: 'FIRST_STEP_FAILED' }));
-    expect(JSON.stringify(response)).not.toContain('secret first error');
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({ category: 'internal_error', code: 'BUSINESS_SCRIPT_HOST_CALL_FAILED' }));
+    expect(JSON.stringify(response)).not.toMatch(/FIRST_STEP_FAILED|SECOND_STEP_FAILED|secret first|secret second/);
     await client.close(); await app.close();
   });
 
