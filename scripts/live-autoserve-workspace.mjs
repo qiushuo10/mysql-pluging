@@ -46,9 +46,9 @@ try {
   assert(bindings.some((item) => item.datasource_id === 'proofline' && item.environment === 'test'), 'proofline/test binding missing');
 
   const fixtureArguments = {
-      sql: "SELECT order_no, external_order_no FROM work_order WHERE external_order_no IS NOT NULL AND external_order_no <> '' ORDER BY id DESC LIMIT 1",
-      parameters: {},
-      max_rows: 1,
+    sql: "SELECT order_no, external_order_no FROM work_order WHERE external_order_no IS NOT NULL AND external_order_no <> '' ORDER BY id DESC LIMIT 1",
+    parameters: {},
+    max_rows: 1,
   };
   const fixture = await client.callTool({ name: 'sql_query', arguments: fixtureArguments });
   assert(!fixture.isError, `test fixture lookup failed: ${JSON.stringify(fixture.content)}`);
