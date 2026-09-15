@@ -1,0 +1,36 @@
+schema_version: mysql-agent/business-pack/2
+pack_id: example-order-center
+version: 2.0.0
+operations:
+  - id: order.find
+    kind: sql
+    domain: order
+    name: find
+    title: Find order
+    description: Return one order.
+    use_when: Use when a complete order ID is available.
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    input:
+      id: { type: string, min_length: 1, max_length: 64, trim: true }
+    sql_file: sql/find.sql
+    max_rows: 1
+
+  - id: order.diagnose
+    kind: script
+    domain: order
+    name: diagnose
+    title: Diagnose order
+    description: Wrap the fixed order query as one structured diagnosis.
+    use_when: Use when an order should be diagnosed in one tool call.
+    datasource: autoserver
+    environments: [test]
+    mode: read
+    exposure: direct
+    input:
+      id: { type: string, min_length: 1, max_length: 64, trim: true }
+    script_file: scripts/diagnose.ts
+    uses: [order.find]
+    timeout_ms: 3000
+    max_result_bytes: 32768

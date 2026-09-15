@@ -524,6 +524,7 @@ export interface MysqlMcpApplication {
   businessRegistry: BusinessOperationRegistry;
   businessPacksHome: string | null;
   businessPacks: readonly LoadedBusinessPack[];
+  disabledBusinessOperations: readonly import('../business-packs/loader.js').DisabledBusinessOperation[];
   mode: RuntimeMode;
   workspaceManager: WorkspaceManager | null;
   traceRecorder: TraceRecorder;
@@ -544,18 +545,19 @@ export function createMysqlMcpApplication(options: {
   }
   const workspaceManager = mode === 'workspace' ? new WorkspaceManager(options.workspacePath!) : null;
   const workspaceLoads = workspaceManager && !options.operations
-    ? workspaceManager.context.businessPackPaths.map((path) => loadBusinessOperations(path))
+    ? workspaceManager.context.businessPackPaths.map((path) => loadBusinessOperations(path, { workspace: workspaceManager.context }))
     : [];
   const loaded = options.operations
-    ? { operations: options.operations, packs: [] as const, home: null }
+    ? { operations: options.operations, packs: [] as const, disabledOperations: [] as const, home: null }
     : workspaceManager
       ? {
           operations: workspaceLoads.flatMap((item) => [...item.operations]),
           packs: workspaceLoads.flatMap((item) => [...item.packs]),
+          disabledOperations: workspaceLoads.flatMap((item) => [...item.disabledOperations]),
           home: workspaceManager.context.businessPackPaths[0] ?? null,
         }
       : mode === 'admin'
-        ? { operations: [] as readonly BusinessOperation[], packs: [] as const, home: null }
+        ? { operations: [] as readonly BusinessOperation[], packs: [] as const, disabledOperations: [] as const, home: null }
         : loadBusinessOperations(options.businessPacksHome);
   const businessRegistry = new BusinessOperationRegistry(loaded.operations);
   const store = new StateStore(options.stateHome);
@@ -571,7 +573,7 @@ export function createMysqlMcpApplication(options: {
   const traceRecorder = new TraceRecorder(store);
   const server = new McpServer({ name: 'mysql-agent', version: '0.3.0' });
   if (workspaceManager) {
-    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server), recorder: traceRecorder });
+    registerWorkspaceTools({ server, manager: workspaceManager, store, service, registry: businessRegistry, getClientName: () => clientName(server), recorder: traceRecorder, disabledOperations: loaded.disabledOperations });
   } else {
     registerBaseTools(server, store, service, businessRegistry, mode === 'admin' ? 'admin' : 'global');
     if (mode === 'global') registerBusinessTools(server, service, businessRegistry);
@@ -583,9 +585,10 @@ export function createMysqlMcpApplication(options: {
     businessRegistry,
     businessPacksHome: loaded.home,
     businessPacks: loaded.packs,
+    disabledBusinessOperations: loaded.disabledOperations,
     mode,
     workspaceManager,
     traceRecorder,
-    close: () => service.close(),
+    close: async () => { await businessRegistry.close(); await service.close(); },
   };
 }

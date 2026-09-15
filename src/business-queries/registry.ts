@@ -5,9 +5,11 @@ import { ALIAS_PATTERN, MAX_AFFECTED_ROWS, MAX_MAX_ROWS } from '../constants.js'
 import { PluginError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
 import type { ConnectionIdentity } from '../config/store.js';
+import type { BusinessScriptRuntime } from '../business-scripts/runtime.js';
+import { RunBusinessScriptRuntime } from '../business-scripts/runtime.js';
 import { compileNamedParameters, discoverNamedParameters } from '../sql/parameters.js';
 import { validateQuerySql, validateWriteSql } from '../sql/validator.js';
-import type { ExecutionContext } from '../trace/recorder.js';
+import { TraceRecorder, type ExecutionContext } from '../trace/recorder.js';
 import type { SqlParameters, SqlScalar } from '../types.js';
 import type { ConnectionEnvironment } from '../types.js';
 import type { BusinessOperation } from './definition.js';
@@ -16,19 +18,22 @@ export class BusinessOperationRegistry {
   private readonly operations: readonly BusinessOperation[];
   private readonly byId: Map<string, BusinessOperation>;
 
-  constructor(operations: readonly BusinessOperation[]) {
+  constructor(
+    operations: readonly BusinessOperation[],
+    private readonly scriptRuntime: BusinessScriptRuntime = new RunBusinessScriptRuntime(),
+  ) {
     this.operations = [...operations];
     this.byId = new Map();
     for (const operation of this.operations) {
       validateBusinessOperation(operation);
-      if (this.byId.has(operation.id)) {
+      if (this.byId.has(operation.registrationId)) {
         throw new PluginError({
           category: 'config_error',
           code: 'DUPLICATE_BUSINESS_OPERATION',
           message: `业务操作 ${operation.id} 重复注册。`,
         });
       }
-      this.byId.set(operation.id, operation);
+      this.byId.set(operation.registrationId, operation);
     }
     this.validateToolNames();
     const directCount = this.operations.filter((operation) => operation.exposure === 'direct').length;
@@ -126,6 +131,10 @@ export class BusinessOperationRegistry {
     return this.operations;
   }
 
+  async close(): Promise<void> {
+    await this.scriptRuntime.close();
+  }
+
   grouped(): Array<{ toolName: string; connection: string; domain: string; lane: 'read' | 'write'; operations: BusinessOperation[] }> {
     const groups = new Map<string, BusinessOperation[]>();
     for (const operation of this.operations.filter((item) => item.exposure === 'domain')) {
@@ -154,8 +163,13 @@ export class BusinessOperationRegistry {
       expectedConnection?: ConnectionIdentity;
       publicOperationId?: string;
       traceContext?: ExecutionContext;
+      traceRecorder?: TraceRecorder;
+      resolveConnection?: (datasourceId: string) => { alias: string; identity: ConnectionIdentity };
     },
   ): Promise<Record<string, unknown>> {
+    if (operation.kind === 'script') {
+      return this.executeScript(operation, input, service, signal, clientName, executionContext);
+    }
     const parameters = parseBusinessParameters(operation, input);
     if (operation.mode === 'read') {
       return service.query({
@@ -197,6 +211,75 @@ export class BusinessOperationRegistry {
       expectedConnection: executionContext?.expectedConnection,
       traceContext: executionContext?.traceContext,
     });
+  }
+
+  private async executeScript(
+    operation: BusinessOperation,
+    input: unknown,
+    service: MysqlService,
+    signal?: AbortSignal,
+    clientName?: string,
+    executionContext?: {
+      workspaceId: string;
+      datasourceId: string;
+      environment: ConnectionEnvironment;
+      expectedConnection?: ConnectionIdentity;
+      publicOperationId?: string;
+      traceContext?: ExecutionContext;
+      traceRecorder?: TraceRecorder;
+      resolveConnection?: (datasourceId: string) => { alias: string; identity: ConnectionIdentity };
+    },
+  ): Promise<Record<string, unknown>> {
+    if (!executionContext?.traceContext || !executionContext.traceRecorder || !executionContext.resolveConnection || !operation.environment) {
+      throw new PluginError({ category: 'config_error', code: 'BUSINESS_SCRIPT_WORKSPACE_REQUIRED', message: '脚本业务操作只能在可追踪的 workspace context 中执行。' });
+    }
+    const parsed = operation.input.parse(input) as Record<string, unknown>;
+    let stepIndex = 0;
+    const result = await this.scriptRuntime.execute({
+      id: operation.id,
+      source: operation.script!,
+      timeoutMs: operation.timeoutMs ?? 10_000,
+      maxResultBytes: operation.maxResultBytes ?? 262_144,
+      input: parsed,
+      signal,
+      callOperation: async (operationId, childInput, childSignal) => {
+        if (!operation.uses.includes(operationId)) {
+          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_OPERATION_NOT_ALLOWED', message: '脚本请求了未授权的内部操作。' });
+        }
+        const matches = this.operations.filter((candidate) => candidate.kind === 'sql'
+          && candidate.id === operationId && candidate.environment === operation.environment);
+        if (matches.length !== 1) {
+          throw new PluginError({ category: 'config_error', code: 'BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', message: `内部操作 ${operationId} 无法在当前环境唯一解析。` });
+        }
+        const dependency = matches[0]!;
+        if (dependency.mode !== 'read') {
+          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_WRITE_FORBIDDEN', message: '脚本只能调用只读业务操作。' });
+        }
+        const datasourceId = dependency.datasourceIds[0];
+        if (!datasourceId || !operation.datasourceIds.includes(datasourceId)) {
+          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_DATASOURCE_NOT_ALLOWED', message: '脚本请求了未声明的数据源。' });
+        }
+        const live = executionContext.resolveConnection!(datasourceId);
+        if (dependency.connection !== live.alias || operation.connectionBindings[datasourceId] !== live.alias) {
+          throw new PluginError({ category: 'permission_error', code: 'BUSINESS_SCRIPT_TARGET_CHANGED', message: '脚本依赖的 workspace binding 已变化，请重新连接。' });
+        }
+        const childStep = ++stepIndex;
+        return executionContext.traceRecorder!.withChild(executionContext.traceContext!, {
+          operationId: dependency.id, operationKind: 'sql', datasourceId, environment: operation.environment,
+          connectionAlias: live.alias, stepIndex: childStep,
+        }, (childTrace) => this.execute(dependency, childInput, service, childSignal, clientName, {
+          workspaceId: executionContext.workspaceId, datasourceId, environment: operation.environment!,
+          expectedConnection: live.identity, publicOperationId: dependency.id, traceContext: childTrace,
+        }));
+      },
+    });
+    return {
+      schema_version: 'mysql-agent/result/1', status: 'ok', kind: 'business_script',
+      business_operation_id: executionContext.publicOperationId ?? operation.id,
+      business_pack_id: operation.packId ?? null, business_pack_version: operation.packVersion ?? null,
+      business_operation_hash: operation.operationHash ?? null, script_hash: operation.scriptHash ?? null,
+      output: result.value, result_bytes: result.resultBytes,
+    };
   }
 }
 
@@ -321,6 +404,9 @@ function isSqlScalar(value: unknown): value is SqlScalar {
 
 /** Revalidates parsed Zod output before it can reach named SQL compilation. */
 export function parseBusinessParameters(operation: BusinessOperation, input: unknown): SqlParameters {
+  if (operation.kind !== 'sql' || operation.sql === undefined) {
+    throw new PluginError({ category: 'config_error', code: 'BUSINESS_SQL_REQUIRED', message: `业务操作 ${operation.id} 不是 SQL 操作。` });
+  }
   const parsed: unknown = operation.input.parse(input);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new PluginError({ category: 'argument_error', code: 'INVALID_BUSINESS_PARAMETER_VALUE', message: '业务操作参数必须是对象。' });
@@ -351,9 +437,20 @@ function validateBusinessOperation(operation: BusinessOperation): void {
       message: `业务操作 ${operation.id} 的 connection ${operation.connection} 不符合别名规则。`,
     });
   }
-  if (operation.timeoutMs !== undefined && (!Number.isInteger(operation.timeoutMs) || operation.timeoutMs < 100 || operation.timeoutMs > 300_000)) {
+  const timeoutMaximum = operation.kind === 'script' ? 10_000 : 300_000;
+  if (operation.timeoutMs !== undefined && (!Number.isInteger(operation.timeoutMs) || operation.timeoutMs < 100 || operation.timeoutMs > timeoutMaximum)) {
     throw new PluginError({ category: 'config_error', code: 'INVALID_BUSINESS_TIMEOUT', message: `业务操作 ${operation.id} 的 timeoutMs 无效。` });
   }
+  if (operation.kind === 'script') {
+    if (operation.mode !== 'read' || !operation.script || operation.uses.length < 1 || operation.uses.length > 16
+      || operation.datasourceIds.length < 1 || operation.datasourceIds.length > 16
+      || !operation.environment || !Number.isInteger(operation.maxResultBytes)
+      || operation.maxResultBytes! < 1 || operation.maxResultBytes! > 262_144) {
+      throw new PluginError({ category: 'config_error', code: 'INVALID_BUSINESS_SCRIPT', message: `业务脚本 ${operation.id} 的定义或边界无效。` });
+    }
+    return;
+  }
+  if (operation.sql === undefined) throw new PluginError({ category: 'config_error', code: 'BUSINESS_SQL_REQUIRED', message: `业务操作 ${operation.id} 缺少 SQL。` });
   const kinds = placeholderKinds(operation.sql);
   const parameters: SqlParameters = Object.fromEntries(
     [...kinds].map(([name, kind]) => [name, kind === 'list' ? [null] : null]),

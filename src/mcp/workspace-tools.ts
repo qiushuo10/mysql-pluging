@@ -7,6 +7,7 @@ import { validateToolName } from '@modelcontextprotocol/sdk/shared/toolNameValid
 import { z } from 'zod';
 
 import type { BusinessOperation } from '../business-queries/definition.js';
+import type { DisabledBusinessOperation } from '../business-packs/loader.js';
 import { BusinessOperationRegistry } from '../business-queries/registry.js';
 import type { AddConnectionInput, ConnectionIdentity, StateStore } from '../config/store.js';
 import { PluginError, unknownError } from '../errors.js';
@@ -228,6 +229,23 @@ function liveTarget(manager: WorkspaceManager, store: StateStore, source: Worksp
   return { ...source, alias, policy, identity: identityOf(connection) };
 }
 
+function resolveWorkspaceConnection(
+  manager: WorkspaceManager,
+  store: StateStore,
+  datasourceId: string,
+  environment: ConnectionEnvironment,
+  expectedIdentity?: ConnectionIdentity,
+): { alias: string; identity: ConnectionIdentity } {
+  const alias = manager.binding(datasourceId, environment);
+  if (!alias) throw configError('WORKSPACE_BINDING_NOT_FOUND', `binding ${datasourceId}/${environment} 已不存在，请重新连接。`);
+  const connection = validateBinding(store, manager.context, { datasourceId, environment, alias });
+  if (expectedIdentity && alias !== expectedIdentity.alias) {
+    throw configError('WORKSPACE_BUSINESS_RECONNECT_REQUIRED', '业务 binding 已变更；请重新连接以装载对应业务操作。');
+  }
+  if (expectedIdentity) store.assertConnectionIdentity(expectedIdentity);
+  return { alias, identity: expectedIdentity ?? identityOf(connection) };
+}
+
 function publicWorkspaceResult(data: Record<string, unknown>, target: WorkspaceTarget): Record<string, unknown> {
   const copy = { ...data };
   delete copy.connection;
@@ -241,6 +259,15 @@ function publicWorkspaceResult(data: Record<string, unknown>, target: WorkspaceT
 
 function publicOperationId(operation: BusinessOperation, target: WorkspaceTarget): string {
   return operation.id.endsWith(`.${target.alias}`) ? operation.id.slice(0, -(target.alias.length + 1)) : operation.id;
+}
+
+function publicBusinessResult(data: Record<string, unknown>, operation: BusinessOperation, target: WorkspaceTarget): Record<string, unknown> {
+  const value = publicWorkspaceResult(data, target);
+  if (operation.kind === 'script') {
+    value.datasource_ids = operation.datasourceIds;
+    delete value.datasource_id;
+  }
+  return value;
 }
 
 function registerName(names: Set<string>, name: string): void {
@@ -394,9 +421,12 @@ function registerWorkspaceBusinessTools(
       inputSchema: item.operation.input,
       annotations: annotations(item.operation),
     }, (args, extra) => tracedSafe(recorder, {
-      workspaceId: manager.context.workspaceId, operationId: publicOperationId(item.operation, item.target), operationKind: 'sql',
-      datasourceIds: [item.target.datasourceId], environment: item.target.environment, connectionAliases: [item.target.alias],
+      workspaceId: manager.context.workspaceId, operationId: publicOperationId(item.operation, item.target), operationKind: item.operation.kind,
+      datasourceIds: item.operation.kind === 'script' ? [...item.operation.datasourceIds] : [item.target.datasourceId],
+      environment: item.target.environment,
+      connectionAliases: item.operation.kind === 'script' ? Object.values(item.operation.connectionBindings) : [item.target.alias],
       packId: item.operation.packId, packVersion: item.operation.packVersion, operationHash: item.operation.operationHash,
+      scriptHash: item.operation.scriptHash,
     }, async (traceContext) => {
       const target = liveTarget(manager, store, item.target);
       if (target.alias !== item.operation.connection) {
@@ -405,9 +435,14 @@ function registerWorkspaceBusinessTools(
       const value = await registry.execute(item.operation, args, service, extra.signal, getClientName(), {
         workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
         expectedConnection: target.identity, publicOperationId: publicOperationId(item.operation, target),
-        traceContext,
+        traceContext, traceRecorder: recorder,
+        resolveConnection: (datasourceId) => {
+          const expected = targets.find((candidate) => candidate.datasourceId === datasourceId && candidate.environment === target.environment)?.identity;
+          if (!expected) throw configError('BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', `脚本数据源 ${datasourceId}/${target.environment} 未在启动快照中唯一解析。`);
+          return resolveWorkspaceConnection(manager, store, datasourceId, target.environment, expected);
+        },
       });
-      return result('business_operation', publicWorkspaceResult(value, target));
+      return result('business_operation', publicBusinessResult(value, item.operation, target));
     }));
   }
 
@@ -440,9 +475,12 @@ function registerWorkspaceBusinessTools(
       const selected = group.find(({ operation }) => operation.name === operationName);
       if (!selected) return safe(() => { throw configError('BUSINESS_OPERATION_NOT_FOUND', `工具 ${toolName} 不包含 ${operationName}。`); });
       return tracedSafe(recorder, {
-        workspaceId: manager.context.workspaceId, operationId: publicOperationId(selected.operation, selected.target), operationKind: 'sql',
-        datasourceIds: [selected.target.datasourceId], environment: selected.target.environment, connectionAliases: [selected.target.alias],
+        workspaceId: manager.context.workspaceId, operationId: publicOperationId(selected.operation, selected.target), operationKind: selected.operation.kind,
+        datasourceIds: selected.operation.kind === 'script' ? [...selected.operation.datasourceIds] : [selected.target.datasourceId],
+        environment: selected.target.environment,
+        connectionAliases: selected.operation.kind === 'script' ? Object.values(selected.operation.connectionBindings) : [selected.target.alias],
         packId: selected.operation.packId, packVersion: selected.operation.packVersion, operationHash: selected.operation.operationHash,
+        scriptHash: selected.operation.scriptHash,
       }, async (traceContext) => {
         const parsed = inputSchema.parse(args) as { operation: string; input: unknown };
         const target = liveTarget(manager, store, selected.target);
@@ -452,8 +490,14 @@ function registerWorkspaceBusinessTools(
         const value = await registry.execute(selected.operation, parsed.input, service, extra.signal, getClientName(), {
           workspaceId: manager.context.workspaceId, datasourceId: target.datasourceId, environment: target.environment,
           expectedConnection: target.identity, publicOperationId: publicOperationId(selected.operation, target), traceContext,
+          traceRecorder: recorder,
+          resolveConnection: (datasourceId) => {
+            const expected = targets.find((candidate) => candidate.datasourceId === datasourceId && candidate.environment === target.environment)?.identity;
+            if (!expected) throw configError('BUSINESS_SCRIPT_DEPENDENCY_RESOLUTION_FAILED', `脚本数据源 ${datasourceId}/${target.environment} 未在启动快照中唯一解析。`);
+            return resolveWorkspaceConnection(manager, store, datasourceId, target.environment, expected);
+          },
         });
-        return result('business_operation', publicWorkspaceResult(value, target));
+        return result('business_operation', publicBusinessResult(value, selected.operation, target));
       });
     });
   }
@@ -472,8 +516,10 @@ function registerWorkspaceBusinessTools(
       .slice(0, args.limit)
       .map(({ operation, target }) => ({
         id: publicOperationId(operation, target), domain: operation.domain, name: operation.name, title: operation.title,
-        description: operation.description, use_when: operation.useWhen, mode: operation.mode,
-        datasource_id: target.datasourceId, environment: target.environment, exposure: operation.exposure,
+        description: operation.description, use_when: operation.useWhen, mode: operation.mode, kind: operation.kind,
+        datasource_id: operation.kind === 'sql' ? target.datasourceId : undefined,
+        datasource_ids: operation.kind === 'script' ? operation.datasourceIds : undefined,
+        environment: target.environment, exposure: operation.exposure,
         input_schema: z.toJSONSchema(operation.input), business_pack_id: operation.packId ?? null,
         business_pack_version: operation.packVersion ?? null, business_operation_hash: operation.operationHash ?? null,
       }));
@@ -520,6 +566,7 @@ function registerWorkspaceManagementTools(
   manager: WorkspaceManager,
   store: StateStore,
   service: MysqlService,
+  disabledOperations: readonly DisabledBusinessOperation[],
 ): void {
   const addTool = (name: string) => registerName(names, name);
   addTool('workspace_datasource_add');
@@ -690,6 +737,7 @@ function registerWorkspaceManagementTools(
     return result('workspace_validate', {
       workspace_id: manager.context.workspaceId, valid: true, binding_count: manager.allBindings().length,
       exposed_target_count: targets.length, root_hash: manager.context.rootHash,
+      disabled_business_operations: disabledOperations,
     });
   }));
 }
@@ -702,6 +750,7 @@ export function registerWorkspaceTools(input: {
   registry: BusinessOperationRegistry;
   getClientName: () => string;
   recorder?: TraceRecorder;
+  disabledOperations?: readonly DisabledBusinessOperation[];
 }): void {
   const names = new Set<string>();
   const recorder = input.recorder ?? new TraceRecorder(input.store);
@@ -797,5 +846,5 @@ export function registerWorkspaceTools(input: {
   }));
 
   registerWorkspaceBusinessTools(input.server, names, input.manager, input.store, input.service, input.registry, targets, input.getClientName, recorder);
-  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service);
+  registerWorkspaceManagementTools(input.server, names, input.manager, input.store, input.service, input.disabledOperations ?? []);
 }

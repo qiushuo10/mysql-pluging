@@ -14,7 +14,15 @@ export interface BusinessOperationOptions<InputSchema extends z.ZodObject> {
   connection: string;
   mode: BusinessMode;
   input: InputSchema;
+  /** Omitted by legacy callers and treated as `sql`. */
+  kind?: 'sql' | 'script';
   sql: string;
+  script?: string;
+  uses?: readonly string[];
+  datasourceIds?: readonly string[];
+  environment?: 'dev' | 'test' | 'staging' | 'prod' | 'custom';
+  connectionBindings?: Readonly<Record<string, string>>;
+  registrationId?: string;
   timeoutMs?: number;
   maxRows?: number;
   maxAffectedRows?: number;
@@ -24,10 +32,17 @@ export interface BusinessOperationOptions<InputSchema extends z.ZodObject> {
   packId?: string;
   packVersion?: string;
   operationHash?: string;
+  scriptHash?: string;
+  maxResultBytes?: number;
 }
 
 export interface BusinessOperation<InputSchema extends z.ZodObject = z.ZodObject> extends BusinessOperationOptions<InputSchema> {
+  readonly kind: 'sql' | 'script';
   readonly exposure: 'direct' | 'domain';
+  readonly uses: readonly string[];
+  readonly datasourceIds: readonly string[];
+  readonly connectionBindings: Readonly<Record<string, string>>;
+  readonly registrationId: string;
 }
 
 const TOOL_PART_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
@@ -56,9 +71,18 @@ export function defineBusinessOperation<InputSchema extends z.ZodObject>(
       message: `业务操作 ${options.id} 必须以 ${options.domain}. 开头。`,
     });
   }
+  const kind = options.kind ?? 'sql';
+  if (kind === 'script' && typeof options.script !== 'string') {
+    throw new PluginError({ category: 'config_error', code: 'BUSINESS_SCRIPT_REQUIRED', message: `业务操作 ${options.id} 缺少脚本。` });
+  }
   return Object.freeze({
     ...options,
+    kind,
     input: options.input.strict() as InputSchema,
     exposure: options.exposure ?? 'domain',
+    uses: Object.freeze([...(options.uses ?? [])]),
+    datasourceIds: Object.freeze([...(options.datasourceIds ?? [])]),
+    connectionBindings: Object.freeze({ ...(options.connectionBindings ?? {}) }),
+    registrationId: options.registrationId ?? options.id,
   });
 }
