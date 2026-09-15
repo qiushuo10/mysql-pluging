@@ -261,7 +261,7 @@ connection_remove(alias)
 
 SQLite 使用 WAL、`busy_timeout` 和短事务。Codex 与 DSH 同时运行时可以共享连接配置；连接配置更新后，MCP Server 通过 revision 失效对应连接池。
 
-状态迁移在 `BEGIN IMMEDIATE` 内按版本顺序执行，支持旧状态库原地升级和重复启动。v5 将 `pool_max` 限制为 2，补充数据源元数据，并保留旧版本进程的连接写入兼容。检测到高于当前实现的 migration 版本时失败关闭，不尝试降级读取。
+状态迁移在 `BEGIN IMMEDIATE` 内按版本顺序执行，支持旧状态库原地升级和重复启动。v5 将 `pool_max` 限制为 2 并补充数据源元数据；v6 修复早期 v5 的 `datasource_id NOT NULL` 约束并安装旧进程写入兼容触发器。检测到高于当前实现的 migration 版本时失败关闭，不尝试降级读取。
 
 ### 6.4 Schema 快照生命周期
 

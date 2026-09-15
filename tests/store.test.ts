@@ -267,6 +267,74 @@ describe('StateStore', () => {
     second.close();
   });
 
+  it('repairs the incompatible v5 schema without changing existing data or revision', () => {
+    const home = mkdtempSync(join(tmpdir(), 'mysql-agent-store-bad-v5-'));
+    homes.push(home);
+    const path = join(home, 'state.db');
+    const badV5 = new DatabaseSync(path);
+    badV5.exec(`
+      CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations VALUES (1, 'old'), (2, 'old'), (3, 'old'), (4, 'old'), (5, 'bad-v5');
+      CREATE TABLE connections (
+        alias TEXT PRIMARY KEY, datasource_id TEXT NOT NULL,
+        environment TEXT NOT NULL DEFAULT 'custom', owner_scope TEXT NOT NULL DEFAULT 'global',
+        shareable INTEGER NOT NULL DEFAULT 0, description TEXT, host TEXT NOT NULL,
+        port INTEGER NOT NULL DEFAULT 3306, username TEXT NOT NULL, password TEXT NOT NULL,
+        default_database TEXT NOT NULL, allowed_databases_json TEXT NOT NULL DEFAULT '[]',
+        charset TEXT NOT NULL DEFAULT 'utf8mb4', access_mode TEXT NOT NULL DEFAULT 'read_write',
+        connect_timeout_ms INTEGER NOT NULL DEFAULT 5000, query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+        pool_max INTEGER NOT NULL DEFAULT 2, idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+        enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO connections VALUES (
+        'bad-v5-existing', 'stable-source', 'prod', 'team:core', 1, 'preserve me',
+        'db.example.test', 3307, 'agent', 'secret', 'app', '["app"]', 'utf8mb4',
+        'read_only', 6000, 20000, 2, 70000, 1, 8, 'created', 'unchanged'
+      );
+    `);
+    badV5.close();
+
+    const store = new StateStore(home);
+    expect(store.requireConnection('bad-v5-existing')).toEqual(expect.objectContaining({
+      datasourceId: 'stable-source', environment: 'prod', ownerScope: 'team:core', shareable: true,
+      description: 'preserve me', host: 'db.example.test', port: 3307, accessMode: 'read_only',
+      poolMax: 2, revision: 8, createdAt: 'created', updatedAt: 'unchanged',
+    }));
+
+    const oldProcess = new DatabaseSync(path);
+    const datasourceColumn = (oldProcess.prepare('PRAGMA table_info(connections)').all() as Array<{ name: string; notnull: number }>)
+      .find((column) => column.name === 'datasource_id');
+    expect(datasourceColumn?.notnull).toBe(0);
+    oldProcess.prepare(`
+      INSERT INTO connections (
+        alias, description, host, port, username, password, default_database,
+        allowed_databases_json, charset, access_mode, connect_timeout_ms,
+        query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(
+      'bad-v5-late', null, 'localhost', 3306, 'agent', 'secret', 'app', '["app"]',
+      'utf8mb4', 'read_write', 5000, 30000, 10, 60000, 1, 'created', 'created',
+    );
+    expect(oldProcess.prepare('SELECT datasource_id, environment, owner_scope, shareable, pool_max, revision FROM connections WHERE alias = ?')
+      .get('bad-v5-late')).toEqual({
+      datasource_id: 'bad-v5-late', environment: 'custom', owner_scope: 'global', shareable: 0, pool_max: 2, revision: 1,
+    });
+    expect((oldProcess.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }).version)
+      .toBe(STATE_SCHEMA_VERSION);
+    oldProcess.close();
+    expect(store.requireConnection('bad-v5-late')).toEqual(expect.objectContaining({
+      datasourceId: 'bad-v5-late', environment: 'custom', ownerScope: 'global', shareable: false,
+      poolMax: 2, revision: 1,
+    }));
+    store.close();
+
+    const repeated = new StateStore(home);
+    expect(repeated.requireConnection('bad-v5-existing')).toEqual(expect.objectContaining({ revision: 8, updatedAt: 'unchanged' }));
+    repeated.close();
+  });
+
   it('rejects a state database newer than this plugin', () => {
     const home = mkdtempSync(join(tmpdir(), 'mysql-agent-store-future-'));
     homes.push(home);

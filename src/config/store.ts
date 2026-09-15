@@ -271,78 +271,97 @@ export class StateStore {
             .run(MAX_POOL_MAX, new Date().toISOString(), MAX_POOL_MAX);
           const poolDefault = connectionColumns.find((column) => column.name === 'pool_max')?.dflt_value;
           if (poolDefault !== String(DEFAULT_POOL_MAX)) {
-            this.database.exec(`
-              CREATE TABLE _connections_v5_rebuild (
-                alias TEXT PRIMARY KEY,
-                datasource_id TEXT,
-                environment TEXT NOT NULL DEFAULT 'custom',
-                owner_scope TEXT NOT NULL DEFAULT 'global',
-                shareable INTEGER NOT NULL DEFAULT 0,
-                description TEXT,
-                host TEXT NOT NULL,
-                port INTEGER NOT NULL DEFAULT 3306,
-                username TEXT NOT NULL,
-                password TEXT NOT NULL,
-                default_database TEXT NOT NULL,
-                allowed_databases_json TEXT NOT NULL DEFAULT '[]',
-                charset TEXT NOT NULL DEFAULT 'utf8mb4',
-                access_mode TEXT NOT NULL DEFAULT 'read_write',
-                connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
-                query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                pool_max INTEGER NOT NULL DEFAULT ${DEFAULT_POOL_MAX},
-                idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                revision INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-              );
-              INSERT INTO _connections_v5_rebuild (
-                alias, datasource_id, environment, owner_scope, shareable,
-                description, host, port, username, password, default_database,
-                allowed_databases_json, charset, access_mode, connect_timeout_ms,
-                query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
-                created_at, updated_at
-              )
-              SELECT
-                alias, datasource_id, environment, owner_scope, shareable,
-                description, host, port, username, password, default_database,
-                allowed_databases_json, charset, access_mode, connect_timeout_ms,
-                query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
-                created_at, updated_at
-              FROM connections;
-              DROP TABLE connections;
-              ALTER TABLE _connections_v5_rebuild RENAME TO connections;
-            `);
+            this.rebuildConnectionsTableWithCompatibleMetadata();
           }
-          this.database.exec(`
-            CREATE TRIGGER IF NOT EXISTS trg_connections_v5_insert_defaults
-            AFTER INSERT ON connections
-            WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' OR NEW.pool_max > ${MAX_POOL_MAX}
-            BEGIN
-              UPDATE connections
-              SET datasource_id = CASE
-                    WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' THEN NEW.alias
-                    ELSE NEW.datasource_id
-                  END,
-                  pool_max = MIN(NEW.pool_max, ${MAX_POOL_MAX})
-              WHERE alias = NEW.alias;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_connections_v5_pool_cap
-            AFTER UPDATE OF pool_max ON connections
-            WHEN NEW.pool_max > ${MAX_POOL_MAX}
-            BEGIN
-              UPDATE connections SET pool_max = ${MAX_POOL_MAX} WHERE alias = NEW.alias;
-            END;
-          `);
+          this.installConnectionCompatibilityTriggers();
         }
         this.recordMigration(5);
+      }
+      if (current < 6) {
+        const connectionColumns = this.database.prepare('PRAGMA table_info(connections)').all() as Array<{ name: string; notnull: number }>;
+        if (connectionColumns.length > 0) {
+          const datasourceIdColumn = connectionColumns.find((column) => column.name === 'datasource_id');
+          if (datasourceIdColumn?.notnull === 1) {
+            this.rebuildConnectionsTableWithCompatibleMetadata();
+          }
+          this.installConnectionCompatibilityTriggers();
+        }
+        this.recordMigration(6);
       }
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  private rebuildConnectionsTableWithCompatibleMetadata(): void {
+    this.database.exec(`
+      CREATE TABLE _connections_rebuild (
+        alias TEXT PRIMARY KEY,
+        datasource_id TEXT,
+        environment TEXT NOT NULL DEFAULT 'custom',
+        owner_scope TEXT NOT NULL DEFAULT 'global',
+        shareable INTEGER NOT NULL DEFAULT 0,
+        description TEXT,
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL DEFAULT 3306,
+        username TEXT NOT NULL,
+        password TEXT NOT NULL,
+        default_database TEXT NOT NULL,
+        allowed_databases_json TEXT NOT NULL DEFAULT '[]',
+        charset TEXT NOT NULL DEFAULT 'utf8mb4',
+        access_mode TEXT NOT NULL DEFAULT 'read_write',
+        connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
+        query_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+        pool_max INTEGER NOT NULL DEFAULT ${DEFAULT_POOL_MAX},
+        idle_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO _connections_rebuild (
+        alias, datasource_id, environment, owner_scope, shareable,
+        description, host, port, username, password, default_database,
+        allowed_databases_json, charset, access_mode, connect_timeout_ms,
+        query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+        created_at, updated_at
+      )
+      SELECT
+        alias, datasource_id, environment, owner_scope, shareable,
+        description, host, port, username, password, default_database,
+        allowed_databases_json, charset, access_mode, connect_timeout_ms,
+        query_timeout_ms, pool_max, idle_timeout_ms, enabled, revision,
+        created_at, updated_at
+      FROM connections;
+      DROP TABLE connections;
+      ALTER TABLE _connections_rebuild RENAME TO connections;
+    `);
+  }
+
+  private installConnectionCompatibilityTriggers(): void {
+    this.database.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_connections_v5_insert_defaults
+      AFTER INSERT ON connections
+      WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' OR NEW.pool_max > ${MAX_POOL_MAX}
+      BEGIN
+        UPDATE connections
+        SET datasource_id = CASE
+              WHEN NEW.datasource_id IS NULL OR NEW.datasource_id = '' THEN NEW.alias
+              ELSE NEW.datasource_id
+            END,
+            pool_max = MIN(NEW.pool_max, ${MAX_POOL_MAX})
+        WHERE alias = NEW.alias;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_connections_v5_pool_cap
+      AFTER UPDATE OF pool_max ON connections
+      WHEN NEW.pool_max > ${MAX_POOL_MAX}
+      BEGIN
+        UPDATE connections SET pool_max = ${MAX_POOL_MAX} WHERE alias = NEW.alias;
+      END;
+    `);
   }
 
   private recordMigration(version: number): void {
