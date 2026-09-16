@@ -174,11 +174,13 @@ describe('workspace MCP tool surface', () => {
     expect(unauthorized.isError).toBe(true);
     expect(unauthorized.structuredContent).toEqual(expect.objectContaining({ code: 'WORKSPACE_CONNECTION_NOT_AUTHORIZED' }));
 
+    // 本地补丁（AUTOSERVE）：不再强制 prod 绑定只读连接。prod 能否写由
+    // workspace.yml 的 access_mode 与连接自身的 access_mode 共同决定。
     const writableProd = await client.callTool({
       name: 'workspace_datasource_bind', arguments: { datasource_id: 'unsafe', environment: 'prod', alias: 'unsafe-prod' },
     });
-    expect(writableProd.isError).toBe(true);
-    expect(writableProd.structuredContent).toEqual(expect.objectContaining({ code: 'WORKSPACE_PROD_CONNECTION_NOT_READ_ONLY' }));
+    expect(writableProd.isError).toBe(false);
+    expect(writableProd.structuredContent).toEqual(expect.objectContaining({ reconnect_required: true }));
 
     const bound = await client.callTool({
       name: 'workspace_datasource_bind', arguments: { datasource_id: 'shared', environment: 'staging', alias: 'shared-stage' },

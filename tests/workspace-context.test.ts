@@ -79,6 +79,8 @@ business_pack_paths: [/tmp/packs]
 `);
     expect(() => loadWorkspaceContext(absolutePack)).toThrow(/必须是相对 descriptor/);
 
+    // 本地补丁（AUTOSERVE）：prod 是否可写改由 access_mode 配置决定，
+    // schema 不再拒绝 prod + read_write（未声明时仍默认 read_only）。
     const writableProd = workspaceFile(`
 schema_version: mysql-agent/workspace/1
 workspace_id: four
@@ -93,7 +95,9 @@ environments:
     access_mode: read_write
 business_pack_paths: []
 `);
-    expect(() => loadWorkspaceContext(writableProd)).toThrow(/不符合 mysql-agent\/workspace\/1/);
+    expect(loadWorkspaceContext(writableProd).environments.get('prod')).toEqual(
+      expect.objectContaining({ accessMode: 'read_write' }),
+    );
   });
 
   it('merges concurrent updates from two managers without losing a binding', async () => {
