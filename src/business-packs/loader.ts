@@ -63,7 +63,10 @@ const v2SqlOperationSchema = z.object({
 }).strict().superRefine((operation, context) => {
   validateSqlShape(operation, context);
   if (new Set(operation.environments).size !== operation.environments.length) context.addIssue({ code: 'custom', path: ['environments'], message: 'environments must be unique' });
-  if (operation.environments.includes('prod') && operation.mode !== 'read') context.addIssue({ code: 'custom', path: ['mode'], message: 'prod operations must be read' });
+  // 本地补丁（AUTOSERVE）：原先在此拒绝「prod 环境 + 非只读 mode」的业务操作，
+  // 现移除该限制，允许业务包把生产环境声明为可写。是否真的可写改由两道运行期判定决定：
+  // workspace.yml 的 environment.access_mode 与物理连接的 access_mode 必须都是 read_write
+  // （见 workspace-tools.ts 的 matchingOperations）；未显式声明 access_mode 时 prod 仍默认只读。
 });
 
 const v2ScriptOperationSchema = z.object({
