@@ -360,15 +360,15 @@ function assertReadTreeSafe(node: unknown): void {
   Object.values(record).forEach(assertReadTreeSafe);
 }
 
-function validateSelect(ast: AstNode, maxRows: number, requireLimit: boolean): void {
+function validateSelect(ast: AstNode, maxSelectLimit: number, requireLimit: boolean): void {
   assertReadTreeSafe(ast);
   if (requireLimit) {
     const limit = numericLimit(ast);
     if (limit === null) {
       reject('SELECT_LIMIT_REQUIRED', '通用 SELECT 必须包含数字字面量 LIMIT；COUNT 等单行聚合请使用 LIMIT 1。');
     }
-    if (limit < 1 || limit > maxRows) {
-      reject('SELECT_LIMIT_EXCEEDED', `SELECT LIMIT 必须在 1 到 ${maxRows} 之间。`);
+    if (limit < 1 || limit > maxSelectLimit) {
+      reject('SELECT_LIMIT_EXCEEDED', `SELECT LIMIT 必须在 1 到 ${maxSelectLimit} 之间。`);
     }
   }
 }
@@ -376,13 +376,13 @@ function validateSelect(ast: AstNode, maxRows: number, requireLimit: boolean): v
 export function validateQuerySql(
   compiledSql: string,
   allowedDatabases: string[],
-  maxRows: number,
+  maxSelectLimit: number,
 ): SqlValidation {
   const ast = parse(compiledSql);
   assertAllowedDatabases(ast, allowedDatabases);
   const type = String(ast.type ?? '').toLowerCase();
   if (type === 'select') {
-    validateSelect(ast, maxRows, true);
+    validateSelect(ast, maxSelectLimit, true);
     return { kind: 'select', tables: tablesFor(compiledSql, allowedDatabases) };
   }
   if (type === 'show') {
@@ -398,7 +398,7 @@ export function validateQuerySql(
     if (!expr || typeof expr !== 'object' || (expr as AstNode).type !== 'select') {
       reject('EXPLAIN_FORBIDDEN', '通用查询只允许 EXPLAIN SELECT。');
     }
-    validateSelect(expr as AstNode, maxRows, false);
+    validateSelect(expr as AstNode, maxSelectLimit, false);
     return { kind: 'explain', tables: tablesFor(compiledSql, allowedDatabases) };
   }
   reject('QUERY_STATEMENT_REQUIRED', 'sql_query 只允许 SELECT、SHOW、DESCRIBE 或 EXPLAIN SELECT。');

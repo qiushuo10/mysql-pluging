@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 
-import { DEFAULT_MAX_ROWS, MAX_MAX_ROWS, MAX_RESULT_BYTES } from '../constants.js';
+import { DEFAULT_MAX_ROWS, MAX_GENERIC_SELECT_LIMIT, MAX_MAX_ROWS, MAX_RESULT_BYTES } from '../constants.js';
 import { StateStore, type ConnectionIdentity } from '../config/store.js';
 import { PluginError, mapMysqlError, unknownError } from '../errors.js';
 import { parameterShape, sqlFingerprint } from '../discovery/fingerprint.js';
@@ -112,7 +112,8 @@ export class MysqlService {
           message: `max_rows 必须在 1 到 ${MAX_MAX_ROWS} 之间。`,
         });
       }
-      const validation = validateQuerySql(compiled.sql, config.allowedDatabases, maxRows);
+      const maxSelectLimit = request.businessOperationId ? maxRows : MAX_GENERIC_SELECT_LIMIT;
+      const validation = validateQuerySql(compiled.sql, config.allowedDatabases, maxSelectLimit);
       kind = validation.kind;
       discoveryTables = validation.tables;
       const timeoutMs = this.effectiveTimeout(config, request.timeoutMs);

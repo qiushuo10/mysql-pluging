@@ -8,11 +8,13 @@ describe('SQL validation', () => {
     expect(validateQuerySql('SELECT id FROM orders WHERE id = ? LIMIT 20', ['auto_server_fat'], 20).kind).toBe(
       'select',
     );
+    expect(validateQuerySql('SELECT id FROM orders LIMIT 200', ['auto_server_fat'], 200).kind).toBe('select');
     expect(() => validateQuerySql('SELECT * FROM orders', ['auto_server_fat'], 20)).toThrow(/LIMIT/);
     expect(() => validateQuerySql('SELECT COUNT(*) AS total FROM orders', ['auto_server_fat'], 20)).toThrow(
       /COUNT.*LIMIT 1/,
     );
     expect(() => validateQuerySql('SELECT * FROM orders LIMIT 21', ['auto_server_fat'], 20)).toThrow(/1 到 20/);
+    expect(() => validateQuerySql('SELECT * FROM orders LIMIT 201', ['auto_server_fat'], 200)).toThrow(/1 到 200/);
     expect(() => validateQuerySql('SELECT * FROM orders FOR UPDATE LIMIT 1', ['auto_server_fat'], 20)).toThrow(
       /锁定读/,
     );

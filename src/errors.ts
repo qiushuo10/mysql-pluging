@@ -127,6 +127,9 @@ export function mapMysqlError(
   const mysqlCode = mysqlError?.errno;
   const mysqlErrorName = mysqlError?.code;
   const sqlState = mysqlError?.sqlState;
+  const mysqlMessage = mysqlError
+    ? sanitizeMysqlMessage(mysqlError.sqlMessage ?? mysqlError.message, boundValues)
+    : undefined;
   const transient = isTransientMysqlError(error);
 
   if (mysqlCode === 1045) {
@@ -183,9 +186,7 @@ export function mapMysqlError(
     writeOutcome,
     mysqlCode,
     mysqlErrorName,
-    mysqlMessage: mysqlError?.sqlMessage
-      ? sanitizeMysqlMessage(mysqlError.sqlMessage, boundValues)
-      : undefined,
+    mysqlMessage,
     sqlState,
     attemptCount,
     cause: error,

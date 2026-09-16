@@ -98,11 +98,10 @@ describe('MySQL MCP server', () => {
     expect(JSON.stringify(unsafeBigint.content)).not.toContain('CONNECTION_NOT_FOUND');
 
     application.service.query = async () => {
-      const mysqlError = Object.assign(new Error('bad field'), {
+      const mysqlError = Object.assign(new Error("Unknown column 'e.deleted' in 'where clause'"), {
         errno: 1054,
         code: 'ER_BAD_FIELD_ERROR',
         sqlState: '42S22',
-        sqlMessage: "Unknown column 'e.deleted' in 'where clause'",
       });
       throw mapMysqlError(mysqlError, 'auto-dev', 'not_applicable', 1);
     };

@@ -71,4 +71,19 @@ describe('write outcome mapping', () => {
       ['private-value'],
     )).toBe("Incorrect integer value: '[REDACTED]' for column 'tenant_id' at row 1");
   });
+
+  it('falls back to the Error message when sqlMessage is absent', () => {
+    const mysqlError = Object.assign(new Error("Unknown column 'third_code' in 'field list'"), {
+      errno: 1054,
+      code: 'ER_BAD_FIELD_ERROR',
+      sqlState: '42S22',
+    });
+    const error = mapMysqlError(mysqlError, 'auto-prod', 'not_applicable', 1);
+    expect(error).toMatchObject({
+      mysqlCode: 1054,
+      mysqlErrorName: 'ER_BAD_FIELD_ERROR',
+      mysqlMessage: "Unknown column 'third_code' in 'field list'",
+      sqlState: '42S22',
+    });
+  });
 });

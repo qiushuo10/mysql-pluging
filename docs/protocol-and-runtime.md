@@ -168,7 +168,7 @@ SELECT * FROM orders WHERE id IN (:...ids)
 }
 ```
 
-插件先用 SQL lexer 将命名参数编译为 `?` 和有序参数数组，再把原始结构交给 MySQL AST parser 做只读校验，最后调用 `mysql2.execute()`。进入 AST 前，同一个 lexer 会拒绝正常 SQL 代码中的 MySQL `/*!...*/` 和 MariaDB `/*M!...*/` 可执行注释并返回 `EXECUTABLE_COMMENT_FORBIDDEN`；字符串、反引号或行注释中的相同文本不误报。SQL 文本还会无条件拒绝未紧跟 `\n` 的单独 `\r` 并返回 `BARE_CARRIAGE_RETURN_FORBIDDEN`，避免 MySQL 与 parser 对行注释结束位置理解不同；标准 CRLF 保持允许。Parser 不重写 SQL；根 `SELECT` 必须显式包含不超过 `max_rows` 的字面量 `LIMIT`。空数组、未使用参数、缺失参数、重复列表展开或在字符串字面量中伪造占位符都会被拒绝。Parser 无法识别的语法按失败关闭处理，不回退到正则后直接执行。
+插件先用 SQL lexer 将命名参数编译为 `?` 和有序参数数组，再把原始结构交给 MySQL AST parser 做只读校验，最后调用 `mysql2.execute()`。进入 AST 前，同一个 lexer 会拒绝正常 SQL 代码中的 MySQL `/*!...*/` 和 MariaDB `/*M!...*/` 可执行注释并返回 `EXECUTABLE_COMMENT_FORBIDDEN`；字符串、反引号或行注释中的相同文本不误报。SQL 文本还会无条件拒绝未紧跟 `\n` 的单独 `\r` 并返回 `BARE_CARRIAGE_RETURN_FORBIDDEN`，避免 MySQL 与 parser 对行注释结束位置理解不同；标准 CRLF 保持允许。Parser 不重写 SQL；通用查询的根 `SELECT` 必须显式包含 1..200 的字面量 `LIMIT`，`max_rows` 另行限制最终返回行数。空数组、未使用参数、缺失参数、重复列表展开或在字符串字面量中伪造占位符都会被拒绝。Parser 无法识别的语法按失败关闭处理，不回退到正则后直接执行。
 
 参数只能替代值，不能替代表名、字段名、数据库名、排序方向或 SQL 关键字。
 
@@ -240,7 +240,7 @@ Server 先在 SQLite 短事务中删除配置，再阻止新调用借用该别�
 
 允许的根语句：`SELECT`、`SHOW`、`DESCRIBE`、`DESC` 和 `EXPLAIN`。`WITH` 必须解析到只读根语句。`SHOW` 只允许查看目标连接允许数据库内的表、字段、索引和状态，不开放 `SHOW DATABASES`。禁止 `SELECT ... INTO OUTFILE`、锁定读、存储过程调用和多语句。
 
-插件通过 AST 确认根 `SELECT` 已包含不超过 `max_rows` 的字面量 `LIMIT`，但不注入、收紧或重新生成 SQL。最终 `structuredContent`（固定执行信封、完整列元数据和行）受 1 MiB 序列化体积限制；超出时用二分前缀保留能容纳的行，更新 `row_count` 并标记 `truncated: true`。若仅固定信封与列元数据已经超限，则返回 `QUERY_RESULT_METADATA_LIMIT`，不交付超限结构。MCP 文本副本另受 45,000 字符限制，会同时裁剪列和行；`structuredContent` 始终是结果真值。
+插件通过 AST 确认通用查询的根 `SELECT` 已包含 1..200 的字面量 `LIMIT`，但不注入、收紧或重新生成 SQL。`max_rows` 独立限制最终返回行数；SQL 实际返回更多行时，结果被截断并标记 `truncated: true`。最终 `structuredContent`（固定执行信封、完整列元数据和行）受 1 MiB 序列化体积限制；超出时用二分前缀保留能容纳的行，更新 `row_count` 并标记 `truncated: true`。若仅固定信封与列元数据已经超限，则返回 `QUERY_RESULT_METADATA_LIMIT`，不交付超限结构。MCP 文本副本另受 45,000 字符限制，会同时裁剪列和行；`structuredContent` 始终是结果真值。
 
 ### 4.5.1 `schema_search`
 

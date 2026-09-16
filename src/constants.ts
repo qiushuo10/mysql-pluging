@@ -6,6 +6,7 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 export const DEFAULT_QUERY_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_ROWS = 1_000;
 export const MAX_MAX_ROWS = 1_000;
+export const MAX_GENERIC_SELECT_LIMIT = 200;
 export const MAX_AFFECTED_ROWS = 100;
 export const MAX_SQL_BYTES = 65_536;
 export const MAX_RESULT_BYTES = 1_048_576;
