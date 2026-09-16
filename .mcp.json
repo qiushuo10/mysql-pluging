@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "mysql": {
+    "mysql-admin": {
       "command": "node",
-      "args": ["./dist/index.js"],
+      "args": ["./dist/index.js", "--mode", "admin"],
       "cwd": ".",
-      "env_vars": ["MYSQL_AGENT_HOME", "MYSQL_AGENT_BUSINESS_PACKS"]
+      "env_vars": ["MYSQL_AGENT_HOME"]
     }
   }
 }
