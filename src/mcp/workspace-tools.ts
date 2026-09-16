@@ -170,12 +170,9 @@ function validateBinding(
       `binding ${target.datasourceId}/${target.environment} 与连接 ${target.alias} 的 datasource/environment 不一致。`,
     );
   }
-  if (target.environment === 'prod' && connection.accessMode !== 'read_only') {
-    throw configError(
-      'WORKSPACE_PROD_CONNECTION_NOT_READ_ONLY',
-      `生产 binding ${target.datasourceId}/prod 只允许绑定物理 access_mode=read_only 的连接。`,
-    );
-  }
+  // 本地补丁（AUTOSERVE）：原先在此禁止 prod binding 绑定非 read_only 连接
+  // （WORKSPACE_PROD_CONNECTION_NOT_READ_ONLY）。现移除该限制，生产是否可写
+  // 只由 workspace.yml 的 access_mode 与连接行的 access_mode 共同决定。
   const owned = connection.ownerScope === `workspace:${workspace.workspaceId}`;
   const shared = connection.ownerScope === 'global' && connection.shareable === true;
   if (!owned && !shared) {
