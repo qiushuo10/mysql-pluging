@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadBusinessOperations, loadBusinessOperationsFromHomes } from '../src/business-packs/loader.js';
 import { BusinessOperationRegistry } from '../src/business-queries/registry.js';
 import { StateStore } from '../src/config/store.js';
-import { PluginError } from '../src/errors.js';
+import { PluginError, mapMysqlError } from '../src/errors.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from '../src/mcp/server.js';
 import { loadWorkspaceContext } from '../src/workspace/context.js';
 
@@ -621,6 +621,31 @@ operations:
     expect(response.isError).toBe(true);
     expect(response.structuredContent).toEqual(expect.objectContaining({ category, code, retryable }));
     expect(JSON.stringify(response)).not.toMatch(/auto-test|secret_internal_database/);
+    await client.close(); await app.close();
+  });
+
+  it('surfaces a sanitized MySQL diagnostic from a failed script host call', async () => {
+    const state = fixture();
+    writeFileSync(join(state.packs, 'sample', 'scripts', 'combine.ts'), `
+      const input = await workflow.input();
+      return operations.call('order.find', input);
+    `);
+    const app = createMysqlMcpApplication({ stateHome: state.stateHome, mode: 'workspace', workspacePath: state.descriptor });
+    app.service.query = async () => {
+      throw mapMysqlError(Object.assign(new Error('bad field'), {
+        errno: 1054,
+        code: 'ER_BAD_FIELD_ERROR',
+        sqlState: '42S22',
+        sqlMessage: "Unknown column 'third_code' in 'field list'",
+      }), 'auto-test', 'not_applicable', 1);
+    };
+    const client = await connect(app);
+    const response = await client.callTool({ name: 'business__order__combine', arguments: { id: 'A1' } });
+    expect(response.isError).toBe(true);
+    const rendered = JSON.stringify(response);
+    expect(rendered).toContain("Unknown column 'third_code' in 'field list'");
+    expect(rendered).toContain('ER_BAD_FIELD_ERROR, errno 1054, SQLSTATE 42S22');
+    expect(rendered).not.toContain('secret_internal_database');
     await client.close(); await app.close();
   });
 

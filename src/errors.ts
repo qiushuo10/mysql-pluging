@@ -89,6 +89,43 @@ export function sanitizeMysqlMessage(message: string, boundValues: readonly unkn
   return `${redacted.slice(0, MYSQL_MESSAGE_MAX_CHARS - 1)}…`;
 }
 
+export interface MysqlErrorIdentity {
+  mysqlCode?: number | null;
+  mysqlErrorName?: string | null;
+  sqlState?: string | null;
+}
+
+/** Renders `ER_BAD_FIELD_ERROR, errno 1054, SQLSTATE 42S22`, skipping fields MySQL omitted. */
+export function mysqlIdentityLabel(identity: MysqlErrorIdentity): string {
+  return [
+    identity.mysqlErrorName ?? null,
+    identity.mysqlCode === null || identity.mysqlCode === undefined ? null : `errno ${identity.mysqlCode}`,
+    identity.sqlState === null || identity.sqlState === undefined ? null : `SQLSTATE ${identity.sqlState}`,
+  ].filter((value): value is string => value !== null).join(', ');
+}
+
+/** Appends the MySQL identity exactly once so the message stays self-contained. */
+export function withMysqlIdentity(base: string, identity: MysqlErrorIdentity): string {
+  const label = mysqlIdentityLabel(identity);
+  return label && !base.includes(label) ? `${base} (${label})` : base;
+}
+
+/**
+ * Returns the most specific diagnostic available for an error. Agent-facing messages must never be a bare
+ * generic sentence: whenever MySQL supplied a reason or an error identity it is folded in, so any surface
+ * that only renders `message` still lets the agent locate the failure.
+ */
+export function describePluginError(error: PluginError): string {
+  const label = mysqlIdentityLabel(error);
+  let text = error.message;
+  const detail = error.mysqlMessage;
+  if (detail && detail.length > 0 && !text.includes(detail)) {
+    text = `${text.replace(/[。.]$/, '')}：${detail}`;
+  }
+  if (label && !text.includes(label)) text = `${text} (${label})`;
+  return text;
+}
+
 const TRANSIENT_CODES = new Set([
   'ECONNRESET',
   'ECONNREFUSED',
@@ -131,15 +168,25 @@ export function mapMysqlError(
     ? sanitizeMysqlMessage(mysqlError.sqlMessage ?? mysqlError.message, boundValues)
     : undefined;
   const transient = isTransientMysqlError(error);
+  const identity: MysqlErrorIdentity = {
+    mysqlCode: mysqlCode ?? null,
+    mysqlErrorName: mysqlErrorName ?? null,
+    sqlState: sqlState ?? null,
+  };
+  const detail = mysqlMessage && mysqlMessage.length > 0 ? mysqlMessage : undefined;
 
   if (mysqlCode === 1045) {
     return new PluginError({
       category: 'authentication_error',
       code: 'MYSQL_AUTHENTICATION_FAILED',
-      message: `数据源 ${connection} 认证失败。`,
+      message: withMysqlIdentity(
+        detail ? `数据源 ${connection} 认证失败：${detail}` : `数据源 ${connection} 认证失败。`,
+        identity,
+      ),
       writeOutcome,
       mysqlCode,
       mysqlErrorName,
+      mysqlMessage,
       sqlState,
       attemptCount,
       cause: error,
@@ -150,10 +197,16 @@ export function mapMysqlError(
     return new PluginError({
       category: 'permission_error',
       code: 'MYSQL_PERMISSION_DENIED',
-      message: `数据源 ${connection} 拒绝了当前数据库操作。`,
+      message: withMysqlIdentity(
+        detail
+          ? `数据源 ${connection} 拒绝了当前数据库操作：${detail}`
+          : `数据源 ${connection} 拒绝了当前数据库操作。`,
+        identity,
+      ),
       writeOutcome,
       mysqlCode,
       mysqlErrorName,
+      mysqlMessage,
       sqlState,
       attemptCount,
       cause: error,
@@ -162,17 +215,23 @@ export function mapMysqlError(
 
   if (transient) {
     const unknownWrite = writeOutcome === 'unknown';
+    const transientMessage = unknownWrite
+      ? (detail
+        ? `数据源 ${connection} 在写入结果确认前断开：${detail}，无法判断变更是否生效。`
+        : `数据源 ${connection} 在写入结果确认前断开，无法判断变更是否生效。`)
+      : (detail
+        ? `数据源 ${connection} 连接失败或已经断开：${detail}`
+        : `数据源 ${connection} 连接失败或已经断开。`);
     return new PluginError({
       category: unknownWrite ? 'write_outcome_unknown' : 'connection_error',
       code: unknownWrite ? 'MYSQL_WRITE_OUTCOME_UNKNOWN' : 'MYSQL_CONNECTION_LOST',
-      message: unknownWrite
-        ? `数据源 ${connection} 在写入结果确认前断开，无法判断变更是否生效。`
-        : `数据源 ${connection} 连接失败或已经断开。`,
+      message: withMysqlIdentity(transientMessage, identity),
       retryable: !unknownWrite,
       retryAfterMs: unknownWrite ? undefined : 250,
       writeOutcome,
       mysqlCode,
       mysqlErrorName,
+      mysqlMessage,
       sqlState,
       attemptCount,
       cause: error,
@@ -182,7 +241,10 @@ export function mapMysqlError(
   return new PluginError({
     category: 'sql_error',
     code: 'MYSQL_SQL_ERROR',
-    message: 'MySQL 拒绝了当前 SQL，请检查语法、约束和字段。',
+    message: withMysqlIdentity(
+      detail ? `MySQL 拒绝了当前 SQL：${detail}` : 'MySQL 拒绝了当前 SQL，请检查语法、约束和字段。',
+      identity,
+    ),
     writeOutcome,
     mysqlCode,
     mysqlErrorName,
@@ -195,10 +257,17 @@ export function mapMysqlError(
 
 export function unknownError(error: unknown): PluginError {
   if (error instanceof PluginError) return error;
+  const detail = error instanceof Error
+    ? sanitizeMysqlMessage(error.message)
+    : typeof error === 'string'
+      ? sanitizeMysqlMessage(error)
+      : '';
   return new PluginError({
     category: 'internal_error',
     code: 'INTERNAL_ERROR',
-    message: '插件执行失败，请根据 execution_id 查看脱敏日志。',
+    message: detail
+      ? `插件执行失败：${detail}（execution_id 可在脱敏日志中检索完整上下文）`
+      : '插件执行失败，请根据 execution_id 查看脱敏日志。',
     cause: error,
   });
 }

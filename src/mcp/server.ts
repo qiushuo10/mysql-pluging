@@ -14,7 +14,7 @@ import {
 } from '../business-packs/loader.js';
 import { StateStore } from '../config/store.js';
 import { SHUTDOWN_TIMEOUT_MS } from '../constants.js';
-import { PluginError, unknownError } from '../errors.js';
+import { PluginError, describePluginError, unknownError } from '../errors.js';
 import { MysqlService } from '../mysql/service.js';
 import type { SchemaSnapshotLoader } from '../mysql/schema.js';
 import { WorkspaceManager, type RuntimeMode } from '../workspace/context.js';
@@ -102,20 +102,14 @@ function success(text: string, data: Record<string, unknown>): CallToolResult {
 function failure(error: unknown): CallToolResult {
   const pluginError = unknownError(error);
   const executionId = (pluginError as PluginError & { executionId?: string }).executionId ?? randomUUID();
-  const mysqlIdentity = [
-    pluginError.mysqlErrorName,
-    pluginError.mysqlCode === null ? null : `errno ${pluginError.mysqlCode}`,
-    pluginError.sqlState === null ? null : `SQLSTATE ${pluginError.sqlState}`,
-  ].filter((value): value is string => value !== null).join(', ');
-  const reason = pluginError.mysqlMessage ?? pluginError.message;
-  const diagnostic = mysqlIdentity ? `${reason} (${mysqlIdentity})` : reason;
+  const diagnostic = describePluginError(pluginError);
   const structuredContent: Record<string, unknown> = {
     schema_version: 'mysql-agent/result/1',
     execution_id: executionId,
     status: 'error',
     category: pluginError.category,
     code: pluginError.code,
-    message: reason,
+    message: diagnostic,
     retryable: pluginError.retryable,
     write_outcome: pluginError.writeOutcome,
     retry_after_ms: pluginError.retryAfterMs,

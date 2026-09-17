@@ -2,7 +2,7 @@ import { validateToolName } from '@modelcontextprotocol/sdk/shared/toolNameValid
 import { z } from 'zod';
 
 import { ALIAS_PATTERN, MAX_AFFECTED_ROWS, MAX_MAX_ROWS } from '../constants.js';
-import { PluginError } from '../errors.js';
+import { PluginError, withMysqlIdentity } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
 import type { ConnectionIdentity } from '../config/store.js';
 import type { BusinessScriptRuntime } from '../business-scripts/runtime.js';
@@ -22,6 +22,10 @@ interface SafeHostError {
   code: string;
   retryable: boolean;
   writeOutcome: PluginError['writeOutcome'];
+  mysqlCode: number | null;
+  mysqlErrorName: string | null;
+  mysqlMessage: string | null;
+  sqlState: string | null;
 }
 
 interface TrackedChild {
@@ -46,14 +50,25 @@ function safeHostPluginError(error: PluginError): SafeHostError {
   return {
     category: error.category, code: error.code, retryable: error.retryable,
     writeOutcome: error.writeOutcome,
+    // Only the MySQL-issued, already-sanitized diagnostic crosses the sandbox boundary. The free-form host
+    // message may embed internal identifiers and is deliberately not propagated to the agent-facing error.
+    mysqlCode: error.mysqlCode, mysqlErrorName: error.mysqlErrorName,
+    mysqlMessage: error.mysqlMessage, sqlState: error.sqlState,
   };
 }
 
 function restoredHostError(error: SafeHostError): PluginError {
+  const detail = error.mysqlMessage && error.mysqlMessage.length > 0
+    ? `业务脚本内部操作失败：${error.mysqlMessage}`
+    : '业务脚本内部操作失败；详细原因已脱敏，请通过 trace_id 检查对应步骤。';
   return new PluginError({
     category: error.category, code: error.code,
-    message: '业务脚本内部操作失败；详细原因已脱敏，请通过 trace_id 检查对应步骤。',
+    message: withMysqlIdentity(detail, error),
     retryable: error.retryable, writeOutcome: error.writeOutcome,
+    mysqlCode: error.mysqlCode ?? undefined,
+    mysqlErrorName: error.mysqlErrorName ?? undefined,
+    mysqlMessage: error.mysqlMessage ?? undefined,
+    sqlState: error.sqlState ?? undefined,
   });
 }
 

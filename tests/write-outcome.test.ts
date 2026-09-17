@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { PluginError, mapMysqlError, sanitizeMysqlMessage } from '../src/errors.js';
+import { PluginError, describePluginError, mapMysqlError, sanitizeMysqlMessage } from '../src/errors.js';
 import { normalizeWritePluginError } from '../src/mysql/service.js';
 
 describe('write outcome mapping', () => {
@@ -85,5 +85,40 @@ describe('write outcome mapping', () => {
       mysqlMessage: "Unknown column 'third_code' in 'field list'",
       sqlState: '42S22',
     });
+  });
+
+  it('embeds the MySQL reason and identity in the agent-facing message', () => {
+    const mysqlError = Object.assign(new Error('bad field'), {
+      errno: 1054,
+      code: 'ER_BAD_FIELD_ERROR',
+      sqlState: '42S22',
+      sqlMessage: "Unknown column 'e.deleted' in 'where clause'",
+    });
+    const error = mapMysqlError(mysqlError, 'auto-fat', 'not_applicable', 1);
+    expect(error.message).toContain("MySQL 拒绝了当前 SQL：Unknown column 'e.deleted' in 'where clause'");
+    expect(error.message).toContain('ER_BAD_FIELD_ERROR, errno 1054, SQLSTATE 42S22');
+    expect(describePluginError(error)).toBe(error.message);
+  });
+
+  it('embeds the MySQL reason for authentication and permission failures too', () => {
+    const authentication = mapMysqlError(Object.assign(new Error('denied'), {
+      errno: 1045,
+      code: 'ER_ACCESS_DENIED_ERROR',
+      sqlState: '28000',
+      sqlMessage: "Access denied for user 'agent'@'10.0.0.1' (using password: YES)",
+    }), 'auto-fat', 'not_applicable', 1);
+    expect(authentication.category).toBe('authentication_error');
+    expect(authentication.message).toContain("Access denied for user 'agent'@'10.0.0.1' (using password: YES)");
+    expect(authentication.message).toContain('errno 1045');
+
+    const permission = mapMysqlError(Object.assign(new Error('denied'), {
+      errno: 1142,
+      code: 'ER_TABLEACCESS_DENIED_ERROR',
+      sqlState: '42000',
+      sqlMessage: "SELECT command denied to user 'agent'@'%' for table 'orders'",
+    }), 'auto-fat', 'not_applicable', 1);
+    expect(permission.category).toBe('permission_error');
+    expect(permission.message).toContain("SELECT command denied to user 'agent'@'%' for table 'orders'");
+    expect(permission.message).toContain('ER_TABLEACCESS_DENIED_ERROR, errno 1142, SQLSTATE 42000');
   });
 });

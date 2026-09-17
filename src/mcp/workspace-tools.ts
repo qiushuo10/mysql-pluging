@@ -12,7 +12,7 @@ import { BusinessOperationRegistry } from '../business-queries/registry.js';
 import { RegistryGenerationManager } from '../business-queries/generation.js';
 import { loadBusinessOperationsFromHomes } from '../business-packs/loader.js';
 import type { AddConnectionInput, ConnectionIdentity, StateStore } from '../config/store.js';
-import { PluginError, unknownError } from '../errors.js';
+import { PluginError, describePluginError, unknownError } from '../errors.js';
 import type { MysqlService } from '../mysql/service.js';
 import { TraceRecorder, type ExecutionContext, type TraceRootInput } from '../trace/recorder.js';
 import type { ConnectionEnvironment, ConnectionSummary } from '../types.js';
@@ -89,14 +89,17 @@ function failed(
   telemetryPersisted = trace !== undefined,
 ): CallToolResult {
   const normalized = unknownError(error);
+  const diagnostic = describePluginError(normalized);
   const structuredContent = {
     schema_version: 'mysql-agent/result/1', execution_id: randomUUID(), status: 'error',
-    category: normalized.category, code: normalized.code, message: normalized.message,
+    category: normalized.category, code: normalized.code, message: diagnostic,
     retryable: normalized.retryable, write_outcome: normalized.writeOutcome,
+    mysql_code: normalized.mysqlCode, mysql_error_name: normalized.mysqlErrorName,
+    mysql_message: normalized.mysqlMessage, sql_state: normalized.sqlState,
     trace_id: trace?.traceId ?? null, run_id: trace?.runId ?? null,
     telemetry_persisted: telemetryPersisted,
   };
-  return { content: [{ type: 'text', text: `${normalized.code}: ${normalized.message}` }], structuredContent, isError: true };
+  return { content: [{ type: 'text', text: `${normalized.code}: ${diagnostic}` }], structuredContent, isError: true };
 }
 
 function attachTrace(response: CallToolResult, trace: ExecutionContext | null, telemetryPersisted: boolean): CallToolResult {

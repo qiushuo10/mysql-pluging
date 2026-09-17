@@ -9,6 +9,7 @@ import { z } from 'zod';
 
 import { defineBusinessOperation } from '../src/business-queries/definition.js';
 import { StateStore } from '../src/config/store.js';
+import { mapMysqlError } from '../src/errors.js';
 import { createMysqlMcpApplication, type MysqlMcpApplication } from '../src/mcp/server.js';
 
 const roots: string[] = [];
@@ -290,6 +291,45 @@ describe('workspace MCP tool surface', () => {
     expect(describe.isError).toBe(true);
     expect(describe.structuredContent).toEqual(expect.objectContaining({ code: 'AUTH_TARGET_CHANGED' }));
     expect(loaderCalls).toBe(0);
+    await client.close();
+    await application.close();
+  });
+
+  it('surfaces the real MySQL reason and identity instead of a generic SQL error', async () => {
+    const state = fixture();
+    const application = createMysqlMcpApplication({ stateHome: state.home, mode: 'workspace', workspacePath: state.descriptor, operations: [] });
+    const client = await connect(application);
+    application.service.query = async () => {
+      const mysqlError = Object.assign(new Error('aggregate rejected'), {
+        errno: 1140,
+        code: 'ER_MIX_OF_GROUP_FUNC_AND_FIELDS',
+        sqlState: '42000',
+        sqlMessage: "In aggregated query without GROUP BY, expression #1 of SELECT list contains "
+          + "nonaggregated column 'auto_server_prod.ky_work_order_receive_record.routing_rule'; "
+          + 'this is incompatible with sql_mode=only_full_group_by',
+      });
+      throw mapMysqlError(mysqlError, 'auto-dev', 'not_applicable', 1);
+    };
+
+    const response = await client.callTool({
+      name: 'sql_query',
+      arguments: { sql: 'SELECT routing_rule, COUNT(*) AS cnt FROM t WHERE routing_rule IS NULL LIMIT 5' },
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toEqual(expect.objectContaining({
+      code: 'MYSQL_SQL_ERROR',
+      message: expect.stringContaining('only_full_group_by'),
+      mysql_code: 1140,
+      mysql_error_name: 'ER_MIX_OF_GROUP_FUNC_AND_FIELDS',
+      mysql_message: expect.stringContaining('only_full_group_by'),
+      sql_state: '42000',
+    }));
+    const rendered = JSON.stringify(response.content);
+    expect(rendered).toContain('only_full_group_by');
+    expect(rendered).toContain('errno 1140');
+    expect(rendered).toContain('SQLSTATE 42000');
+    expect(rendered).not.toContain('"MYSQL_SQL_ERROR: MySQL 拒绝了当前 SQL，请检查语法、约束和字段。"');
     await client.close();
     await application.close();
   });

@@ -112,12 +112,14 @@ describe('MySQL MCP server', () => {
     expect(mysqlFailure.isError).toBe(true);
     expect(mysqlFailure.structuredContent).toEqual(expect.objectContaining({
       code: 'MYSQL_SQL_ERROR',
-      message: "Unknown column 'e.deleted' in 'where clause'",
+      message: expect.stringContaining("Unknown column 'e.deleted' in 'where clause'"),
       mysql_code: 1054,
       mysql_error_name: 'ER_BAD_FIELD_ERROR',
       mysql_message: "Unknown column 'e.deleted' in 'where clause'",
       sql_state: '42S22',
     }));
+    expect(String((mysqlFailure.structuredContent as { message?: unknown }).message))
+      .toContain('ER_BAD_FIELD_ERROR, errno 1054, SQLSTATE 42S22');
     expect(JSON.stringify(mysqlFailure.content)).toContain("Unknown column 'e.deleted' in 'where clause'");
     expect(JSON.stringify(mysqlFailure.content)).toContain('ER_BAD_FIELD_ERROR');
     expect(JSON.stringify(mysqlFailure.content)).toContain('errno 1054');
